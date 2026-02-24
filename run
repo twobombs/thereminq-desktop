@@ -1,0 +1,20 @@
+#!/bin/bash
+# X-run script for non-nvidia hosts
+rm /tmp/.X0-lock
+
+Xvfb :0 -screen 0 2560x1440x24+32 -ac && service xrdp start &
+sleep 10
+export DISPLAY=:0&&startxfce4&
+x0vncserver -display :0 -passwordfile /root/.vnc/passwd&
+websockify --web=/usr/share/novnc/ 6080 localhost:5900
+
+service xrdp start && xrdp &
+pulseaudio -D --system &
+
+export DISPLAY=:0&&xterm -e "xset s off" 
+export DISPLAY=:0&&xterm -bg black -fg white -e "neofetch && tail -f /dev/null" &
+export DISPLAY=:0&&exo-open --launch TerminalEmulator &
+export DISPLAY=:0 && google-chrome-stable --disable-fre --no-default-browser-check --no-first-run --no-sandbox --password-store=basic https://gemini.google.com  https://chat.openai.com &
+
+
+tail -f /dev/null
