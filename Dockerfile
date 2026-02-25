@@ -20,7 +20,7 @@ RUN apt-get install -y --no-install-recommends \
     # Virtualization
     bridge-utils libvirt-clients libvirt-daemon-system open-vm-tools qemu-kvm virt-manager \
     # Development, Libraries & Drivers
-    ant clinfo dkms freeglut3-dev git intel-gpu-tools intel-opencl-icd libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libglvnd-dev libsdl1.2-dev lm-sensors mesa-opencl-icd mesa-utils ocl-icd-libopencl1 ocl-icd-opencl-dev opencl-headers openjdk-21-jdk pkg-config python3-pip python3-setuptools qv4l2
+    ant clinfo vulkan-tools dkms freeglut3-dev git intel-gpu-tools intel-opencl-icd libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libglvnd-dev libsdl1.2-dev lm-sensors mesa-opencl-icd mesa-utils ocl-icd-libopencl1 ocl-icd-opencl-dev opencl-headers openjdk-21-jdk pkg-config python3-pip python3-setuptools qv4l2
 
 # Gnome-terminal invocation fix and layer cleanup
 RUN apt-get remove -y gnome-terminal && \
