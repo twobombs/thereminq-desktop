@@ -6,7 +6,7 @@ Xvfb :0 -screen 0 2560x1440x24+32 -ac && service xrdp start &
 sleep 10
 export DISPLAY=:0&&startxfce4&
 x0vncserver -display :0 -passwordfile /root/.vnc/passwd&
-websockify --web=/usr/share/novnc/ 6080 localhost:5900
+websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
 
 service xrdp start && xrdp &
 pulseaudio -D --system &
