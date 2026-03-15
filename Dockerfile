@@ -3,6 +3,12 @@ FROM ubuntu:resolute
 # Set noninteractive environment globally
 ENV DEBIAN_FRONTEND=noninteractive
 
+#  Rusticl for AMD
+ENV RUSTICL_ENABLE=radeonsi
+RUN echo "RUSTICL_ENABLE=radeonsi" >> /etc/environment && \
+    echo "export RUSTICL_ENABLE=radeonsi" >> /root/.bashrc
+    
+
 # Configure architecture, repositories, and upgrade base system
 RUN dpkg --add-architecture i386 && \
     apt-get update && \
