@@ -24,7 +24,7 @@ RUN apt-get install -y --no-install-recommends \
     # X11, Desktop & VNC
     dbus-x11 novnc screen ssh-askpass-gnome tigervnc-scraping-server tightvncserver x11vnc xfce4 xfce4-goodies xrdp xterm xvfb \
     # Virtualization
-    bridge-utils libvirt-clients libvirt-daemon-system open-vm-tools qemu-kvm virt-manager \
+    bridge-utils libvirt-clients libvirt-daemon-system open-vm-tools virt-manager \
     # Development, Libraries & Drivers
     ant clinfo vulkan-tools mesa-vulkan-drivers dkms freeglut3-dev git git-lfs unzip intel-gpu-tools intel-opencl-icd libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libglvnd-dev libsdl1.2-dev lm-sensors mesa-opencl-icd mesa-utils ocl-icd-libopencl1 ocl-icd-opencl-dev opencl-headers openjdk-21-jdk pkg-config python3-pip python3-setuptools qv4l2
 
