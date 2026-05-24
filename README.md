@@ -16,7 +16,10 @@ This repository contains a Dockerfile to build a containerized XFCE desktop envi
   - OpenJDK 21
   - Python 3 with `pip`
   - OpenCL libraries and headers
-  - Git, build tools (`ant`, `pkg-config`, `make`)
+  - Vulkan and OpenGL support
+  - Git, Git-LFS, build tools (`ant`, `pkg-config`)
+  - Hugging Face `xet` support
+  - Rusticl support for AMD
 - **Virtualization Support**:
   - KVM/QEMU
   - Libvirt
@@ -29,7 +32,7 @@ This repository contains a Dockerfile to build a containerized XFCE desktop envi
 To build the Docker image, run:
 
 ```bash
-docker build -f Dockerfile-2604 -t thereminq-desktop .
+docker build -t thereminq-desktop .
 ```
 
 ### Running the Container
