@@ -31,6 +31,9 @@ RUN apt-get install -y --no-install-recommends \
 # Native HF xet support
 RUN curl -sSfL https://hf.co/git-xet/install.sh | sh
 
+# install chrome
+RUN wget -qO /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && apt install -y /tmp/chrome.deb && rm /tmp/chrome.deb
+
 # Gnome-terminal invocation fix and layer cleanup
 RUN apt-get remove -y gnome-terminal && \
     apt-get purge -y gnome-terminal && \
