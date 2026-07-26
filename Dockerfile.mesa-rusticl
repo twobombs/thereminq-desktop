@@ -1,0 +1,349 @@
+# =============================================================================
+# Dockerfile.mesa-rusticl
+#
+# Builds Mesa 26.1.4 with:
+#   - rusticl OpenCL ICD (cl_khr_fp16 enabled for vega20 / Radeon Pro V340)
+#   - RADV Vulkan driver (amd)
+#   - Custom libclc (spirv-mesa3d targets, FP16 builtins)
+#
+# Multi-stage: builder produces /usr/local/mesa; runtime copies it in cleanly.
+#
+# Build:
+#   docker build -f Dockerfile.mesa-rusticl -t mesa-rusticl:26.1.4 .
+#   docker build --build-arg NATIVE=1 -f Dockerfile.mesa-rusticl -t mesa-rusticl:26.1.4-native .
+#
+# Run (GPU passthrough via ROCm/DRI device):
+#   docker run --rm --device /dev/dri \
+#     -e RUSTICL_ENABLE=radeonsi \
+#     -e DRI_PRIME=0 \
+#     mesa-rusticl:26.1.4 clinfo
+#
+# Verify fp16:
+#   docker run --rm --device /dev/dri \
+#     -e RUSTICL_ENABLE=radeonsi \
+#     mesa-rusticl:26.1.4 clinfo | grep cl_khr_fp16
+#
+# Verify Vulkan:
+#   docker run --rm --device /dev/dri \
+#     -e VK_ICD_FILENAMES=/usr/local/mesa/share/vulkan/icd.d/radeon_icd.x86_64.json \
+#     mesa-rusticl:26.1.4 vulkaninfo --summary
+# =============================================================================
+
+ARG UBUNTU_VERSION=24.04
+ARG MESA_VERSION=26.1.4
+ARG MESA_SHA256=072705caa9adf4740f1489194b13e278ad959166863b5271fe423a86353c9ab6
+ARG MESA_PREFIX=/usr/local/mesa
+# Set NATIVE=1 at build time to enable -march=native
+ARG NATIVE=0
+
+# =============================================================================
+# Stage 1: builder
+# =============================================================================
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+
+ARG MESA_VERSION
+ARG MESA_SHA256
+ARG MESA_PREFIX
+ARG NATIVE
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
+
+# ---------------------------------------------------------------------------
+# Phase 1: Detect LLVM version and install all build dependencies in one layer
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update -qq; \
+    \
+    # Probe for the highest available LLVM version
+    LLVM_VER=""; \
+    for v in 22 21 20 19 18 17 16 15; do \
+        if apt-cache show "llvm-${v}-dev" >/dev/null 2>&1; then \
+            LLVM_VER="${v}"; break; \
+        fi; \
+    done; \
+    [ -n "${LLVM_VER}" ] || { echo "ERROR: No LLVM dev package found"; exit 1; }; \
+    echo "Using LLVM ${LLVM_VER}"; \
+    \
+    # Core build tools
+    apt-get install -y --no-install-recommends \
+        curl ca-certificates xz-utils git cmake \
+        meson ninja-build pkg-config \
+        python3 python3-mako python3-yaml \
+        gcc g++ bison flex libelf-dev \
+        dpkg-dev; \
+    \
+    # LLVM / Clang
+    apt-get install -y --no-install-recommends \
+        "llvm-${LLVM_VER}-dev" \
+        "libclang-${LLVM_VER}-dev" \
+        "clang-${LLVM_VER}"; \
+    \
+    # libclang-cpp (name varies by distro version)
+    if apt-cache show "libclang-cpp${LLVM_VER}-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends "libclang-cpp${LLVM_VER}-dev"; \
+    elif apt-cache show "libclang-cpp-${LLVM_VER}-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends "libclang-cpp-${LLVM_VER}-dev"; \
+    fi; \
+    \
+    # SPIRV-LLVM-Translator
+    if apt-cache show "llvm-spirv-${LLVM_VER}" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends "llvm-spirv-${LLVM_VER}"; \
+        if [ ! -f /usr/bin/llvm-spirv ] && [ -f "/usr/bin/llvm-spirv-${LLVM_VER}" ]; then \
+            ln -sf "/usr/bin/llvm-spirv-${LLVM_VER}" /usr/bin/llvm-spirv; \
+        fi; \
+    fi; \
+    if apt-cache show "libllvmspirvlib-${LLVM_VER}-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends "libllvmspirvlib-${LLVM_VER}-dev"; \
+    elif apt-cache show "libllvmspirvlib-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends "libllvmspirvlib-dev"; \
+    fi; \
+    \
+    # libclc (package tree filler; overridden by our source build below)
+    if apt-cache show "libclc-${LLVM_VER}-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends "libclc-${LLVM_VER}" "libclc-${LLVM_VER}-dev"; \
+    elif apt-cache show "libclc-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends libclc-dev; \
+    fi; \
+    \
+    # Rust
+    apt-get install -y --no-install-recommends rustc cargo rustfmt; \
+    if apt-cache show "bindgen" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends bindgen; \
+    elif apt-cache show "rust-bindgen" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends rust-bindgen; \
+    fi; \
+    \
+    # SPIR-V tools
+    apt-get install -y --no-install-recommends spirv-tools; \
+    if apt-cache show "spirv-tools-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends spirv-tools-dev; \
+    fi; \
+    if apt-cache show "spirv-headers" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends spirv-headers; \
+    fi; \
+    if apt-cache show "libspirv-cross-c-shared-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends libspirv-cross-c-shared-dev; \
+    fi; \
+    \
+    # Vulkan build deps
+    apt-get install -y --no-install-recommends \
+        libvulkan-dev \
+        libvulkan1 \
+        glslang-tools \
+        glslang-dev \
+        vulkan-tools; \
+    if apt-cache show "vulkan-utility-libraries-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends vulkan-utility-libraries-dev; \
+    elif apt-cache show "vulkan-validationlayers-dev" >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends vulkan-validationlayers-dev; \
+    fi; \
+    \
+    # Wayland / XCB WSI stubs (RADV links against these even headless)
+    apt-get install -y --no-install-recommends \
+        libwayland-dev \
+        libx11-xcb-dev \
+        libxcb-dri3-dev \
+        libxcb-present-dev \
+        libxcb-randr0-dev \
+        libxcb-shm0-dev \
+        libxshmfence-dev; \
+    \
+    # DRM + misc
+    apt-get install -y --no-install-recommends \
+        libdrm-dev \
+        libzstd-dev zlib1g-dev libexpat1-dev \
+        ocl-icd-opencl-dev \
+        clinfo; \
+    \
+    rm -rf /var/lib/apt/lists/*; \
+    \
+    # Verify LLVM / llvm-spirv major version alignment
+    LLVM_MAJOR=$(llvm-config --version 2>/dev/null | grep -oP '^\d+' || echo "?"); \
+    SPIRV_MAJOR=$(llvm-spirv --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1 | cut -d. -f1 || echo "?"); \
+    if [ "${LLVM_MAJOR}" != "?" ] && [ "${SPIRV_MAJOR}" != "?" ] && [ "${LLVM_MAJOR}" != "${SPIRV_MAJOR}" ]; then \
+        echo "ERROR: LLVM major (${LLVM_MAJOR}) != llvm-spirv major (${SPIRV_MAJOR})"; exit 1; \
+    fi; \
+    echo "LLVM_VER=${LLVM_VER}" > /tmp/llvm_ver.env
+
+# ---------------------------------------------------------------------------
+# Phase 1.5: Build custom libclc from source
+# (Fixes Ubuntu's missing FP16 builtins; targets spirv-mesa3d / spirv64-mesa3d)
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    LLVM_VER=$(cat /tmp/llvm_ver.env | cut -d= -f2); \
+    MESA_PREFIX="${MESA_PREFIX}"; \
+    \
+    LLVM_CFG="/usr/bin/llvm-config-${LLVM_VER}"; \
+    [ -f "${LLVM_CFG}" ] || LLVM_CFG=$(command -v llvm-config); \
+    CLANG_C="/usr/bin/clang-${LLVM_VER}"; \
+    [ -f "${CLANG_C}" ]  || CLANG_C=$(command -v clang); \
+    CLANG_CXX="/usr/bin/clang++-${LLVM_VER}"; \
+    [ -f "${CLANG_CXX}" ] || CLANG_CXX=$(command -v clang++); \
+    GCC_DIR=$(dirname "$(gcc -print-libgcc-file-name)"); \
+    \
+    mkdir -p /tmp/libclc-src; \
+    cd /tmp/libclc-src; \
+    git init -q; \
+    git remote add origin https://github.com/llvm/llvm-project.git; \
+    git config core.sparseCheckout true; \
+    echo "libclc/" >> .git/info/sparse-checkout; \
+    if ! git pull -q --depth=1 origin "release/${LLVM_VER}.x" 2>/dev/null; then \
+        git pull -q --depth=1 origin main; \
+    fi; \
+    \
+    cd libclc; \
+    mkdir build; cd build; \
+    cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${MESA_PREFIX}" \
+        -DCMAKE_CXX_COMPILER="${CLANG_CXX}" \
+        -DCMAKE_C_COMPILER="${CLANG_C}" \
+        -DCMAKE_CXX_FLAGS="--gcc-install-dir=${GCC_DIR}" \
+        -DCMAKE_C_FLAGS="--gcc-install-dir=${GCC_DIR}" \
+        -DLLVM_CONFIG="${LLVM_CFG}" \
+        -DLIBCLC_TARGETS_TO_BUILD="spirv-mesa3d-;spirv64-mesa3d-" \
+        ..; \
+    ninja -j"$(nproc)"; \
+    ninja install; \
+    rm -rf /tmp/libclc-src
+
+# ---------------------------------------------------------------------------
+# Phase 2-4: Fetch, configure, build, and install Mesa
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    MESA_PREFIX="${MESA_PREFIX}"; \
+    TARBALL="/tmp/mesa-${MESA_VERSION}.tar.xz"; \
+    \
+    curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" -o "${TARBALL}"; \
+    echo "${MESA_SHA256}  ${TARBALL}" | sha256sum -c -; \
+    \
+    mkdir -p /tmp/mesa-build; \
+    tar -xJ -C /tmp/mesa-build --strip-components=1 -f "${TARBALL}"; \
+    rm "${TARBALL}"; \
+    \
+    LIB_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH); \
+    GCC_DIR=$(dirname "$(gcc -print-libgcc-file-name)"); \
+    \
+    export PKG_CONFIG_PATH="${MESA_PREFIX}/share/pkgconfig:${MESA_PREFIX}/lib/pkgconfig"; \
+    export BINDGEN_EXTRA_CLANG_ARGS="--gcc-install-dir=${GCC_DIR}"; \
+    \
+    NATIVE_FLAGS=""; \
+    if [ "${NATIVE}" = "1" ]; then \
+        NATIVE_FLAGS="-Dc_args=-march=native -Dcpp_args=-march=native"; \
+    fi; \
+    \
+    cd /tmp/mesa-build; \
+    meson setup builddir \
+        --prefix="${MESA_PREFIX}" \
+        --buildtype=release \
+        -Db_ndebug=true \
+        -Dgallium-drivers=radeonsi,llvmpipe,softpipe \
+        -Dvulkan-drivers=amd \
+        -Dplatforms=x11,wayland \
+        -Dglx=disabled \
+        -Degl=disabled \
+        -Dgbm=disabled \
+        -Dgles1=disabled \
+        -Dgles2=disabled \
+        -Dopengl=false \
+        -Dgallium-rusticl=true \
+        -Dllvm=enabled \
+        -Dshared-llvm=enabled \
+        -Drust_std=2021 \
+        -Dvulkan-layers=device-select,overlay \
+        ${NATIVE_FLAGS}; \
+    \
+    ninja -C builddir -j"$(nproc)"; \
+    ninja -C builddir install; \
+    rm -rf /tmp/mesa-build
+
+# ---------------------------------------------------------------------------
+# Phase 5: Register ICDs inside the builder image (paths baked in)
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    MESA_PREFIX="${MESA_PREFIX}"; \
+    LIB_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH); \
+    ARCH=$(uname -m); \
+    \
+    # OpenCL ICD
+    mkdir -p /etc/OpenCL/vendors; \
+    ln -sf "${MESA_PREFIX}/etc/OpenCL/vendors/rusticl.icd" \
+           /etc/OpenCL/vendors/mesa-261-rusticl.icd; \
+    \
+    # Vulkan ICD
+    mkdir -p /etc/vulkan/icd.d; \
+    RADV_ICD="${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${ARCH}.json"; \
+    [ -f "${RADV_ICD}" ] && \
+        ln -sf "${RADV_ICD}" /etc/vulkan/icd.d/mesa-261-radv.json || \
+        echo "WARNING: RADV ICD JSON not found at ${RADV_ICD}"; \
+    \
+    # Vulkan explicit layers
+    LAYER_SRC="${MESA_PREFIX}/share/vulkan/explicit_layer.d"; \
+    if [ -d "${LAYER_SRC}" ]; then \
+        mkdir -p /etc/vulkan/explicit_layer.d; \
+        for f in "${LAYER_SRC}"/*.json; do \
+            [ -f "$f" ] || continue; \
+            ln -sf "$f" "/etc/vulkan/explicit_layer.d/$(basename "$f")"; \
+        done; \
+    fi; \
+    \
+    # ldconfig
+    echo "${MESA_PREFIX}/lib/${LIB_ARCH}" > /etc/ld.so.conf.d/mesa-rusticl.conf; \
+    ldconfig
+
+# =============================================================================
+# Stage 2: runtime
+# Lean image: only the Mesa install + runtime libs, no build tools.
+# =============================================================================
+FROM twobombs/thereminq-desktop AS runtime
+
+ARG MESA_PREFIX
+ARG MESA_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
+
+# Minimal runtime deps: OpenCL loader, Vulkan loader, DRM, clinfo, vulkaninfo
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        ocl-icd-libopencl1 \
+        libvulkan1 \
+        vulkan-tools \
+        libdrm-amdgpu1 \
+        libzstd1 \
+        libexpat1 \
+        libelf1 \
+        clinfo \
+        libwayland-client0 \
+        libx11-6 \
+        libxcb1 \
+        libxshmfence1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the Mesa install tree from builder
+COPY --from=builder ${MESA_PREFIX} ${MESA_PREFIX}
+
+# Copy ICD registrations
+COPY --from=builder /etc/OpenCL/vendors/mesa-261-rusticl.icd \
+                    /etc/OpenCL/vendors/mesa-261-rusticl.icd
+COPY --from=builder /etc/vulkan/icd.d/mesa-261-radv.json \
+                    /etc/vulkan/icd.d/mesa-261-radv.json
+COPY --from=builder /etc/vulkan/explicit_layer.d \
+                    /etc/vulkan/explicit_layer.d
+COPY --from=builder /etc/ld.so.conf.d/mesa-rusticl.conf \
+                    /etc/ld.so.conf.d/mesa-rusticl.conf
+
+RUN ldconfig
+
+# Runtime environment
+ENV RUSTICL_ENABLE=radeonsi \
+    DRI_PRIME=0 \
+    LD_LIBRARY_PATH=${MESA_PREFIX}/lib/x86_64-linux-gnu \
+    VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.x86_64.json
+
+LABEL org.opencontainers.image.title="Mesa ${MESA_VERSION} rusticl+fp16 + RADV Vulkan" \
+      org.opencontainers.image.description="Mesa rusticl OpenCL (cl_khr_fp16) and RADV Vulkan for vega20 / Radeon Pro V340"
+
+# Default: drop into clinfo so you can verify immediately
+CMD ["clinfo"]
