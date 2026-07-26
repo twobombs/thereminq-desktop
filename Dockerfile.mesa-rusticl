@@ -345,5 +345,3 @@ ENV RUSTICL_ENABLE=radeonsi \
 LABEL org.opencontainers.image.title="Mesa ${MESA_VERSION} rusticl+fp16 + RADV Vulkan" \
       org.opencontainers.image.description="Mesa rusticl OpenCL (cl_khr_fp16) and RADV Vulkan for vega20 / Radeon Pro V340"
 
-# Default: drop into clinfo so you can verify immediately
-CMD ["clinfo"]
