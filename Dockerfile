@@ -22,7 +22,7 @@ RUN apt-get install -y --no-install-recommends \
     # Base Utilities & Networking
     adduser btop curl linux-tools-generic locales lynx mc net-tools wget \
     # X11, Desktop & VNC
-    dbus-x11 novnc screen ssh-askpass-gnome tigervnc-scraping-server tightvncserver x11vnc xfce4 xfce4-goodies xrdp arc-theme xterm xvfb \
+    dbus-x11 novnc screen ssh-askpass-gnome tigervnc-scraping-server tightvncserver x11vnc xfce4 xfce4-goodies xrdp arc-theme xterm xvfb gnome-keyring \
     # Virtualization
     bridge-utils libvirt-clients libvirt-daemon-system open-vm-tools virt-manager \
     # Development, Libraries & Drivers
