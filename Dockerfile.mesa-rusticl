@@ -4,6 +4,7 @@
 # Builds Mesa 26.1.4 with:
 #   - rusticl OpenCL ICD (cl_khr_fp16 enabled for vega20 / Radeon Pro V340)
 #   - RADV Vulkan driver (amd)
+#   - Full GL stack: OpenGL, GLES 1/2, DRI-based GLX, EGL, GBM, via libglvnd
 #   - Custom libclc (spirv-mesa3d targets, FP16 builtins)
 #
 # Multi-stage: builder produces /usr/local/mesa; runtime copies it in cleanly.
@@ -33,6 +34,16 @@
 #   docker run --rm --device /dev/dri \
 #     -e VK_ICD_FILENAMES=/usr/local/mesa/share/vulkan/icd.d/radeon_icd.x86_64.json \
 #     mesa-rusticl:26.1.4 vulkaninfo --summary
+#
+# Verify OpenGL / GLX (needs an X display):
+#   docker run --rm --device /dev/dri -e DISPLAY=$DISPLAY \
+#     -v /tmp/.X11-unix:/tmp/.X11-unix \
+#     mesa-rusticl:26.1.4 glxinfo -B
+#
+# Verify EGL vendor resolution:
+#   docker run --rm --device /dev/dri mesa-rusticl:26.1.4 eglinfo -B
+#   docker run --rm mesa-rusticl:26.1.4 \
+#     sh -c 'ldd $(which glxinfo) | grep -i gl'
 # =============================================================================
 
 ARG UBUNTU_VERSION=26.04
@@ -150,24 +161,47 @@ RUN set -eux; \
         apt-get install -y --no-install-recommends vulkan-validationlayers-dev; \
     fi; \
     \
-    # Wayland / XCB WSI (RADV links against these even headless).
-    # wayland-protocols, xcb-xfixes and xcb-sync are NOT pulled in transitively
-    # by libwayland-dev / libxcb-dri3-dev — meson will fail without them.
+    # Wayland / XCB / Xlib WSI and GL platform deps.
+    # Notes on the non-obvious ones:
+    #   wayland-protocols        - not a dep of libwayland-dev
+    #   libwayland-egl-backend-dev - required for the wayland EGL platform
+    #   libxcb-sync-dev          - not pulled in by libxcb-dri3-dev
+    #   libxcb-xfixes0-dev       - not pulled in by libxcb-dri3-dev
+    #   libxrandr-dev            - REQUIRED by -Dplatforms=x11 (xlib-lease /
+    #                              VK_EXT_acquire_xlib_display). Xlib-level
+    #                              libXrandr, NOT xcb-randr; meson hard-fails
+    #                              at meson.build:2283 without it.
+    #   libxcb-keysyms1-dev      - keybind toggle in the Vulkan overlay layer
+    #   libxcb-glx0-dev,
+    #   libxxf86vm-dev,
+    #   libxdamage-dev,
+    #   libxfixes-dev            - DRI-based GLX
+    #   libglvnd-dev             - required by -Dglvnd=true
     apt-get install -y --no-install-recommends \
         libwayland-dev \
+        libwayland-egl-backend-dev \
         wayland-protocols \
+        libglvnd-dev \
         libx11-xcb-dev \
         libxcb-dri3-dev \
+        libxcb-glx0-dev \
+        libxcb-keysyms1-dev \
         libxcb-present-dev \
         libxcb-randr0-dev \
         libxcb-shm0-dev \
         libxcb-sync-dev \
         libxcb-xfixes0-dev \
-        libxshmfence-dev; \
+        libxdamage-dev \
+        libxext-dev \
+        libxfixes-dev \
+        libxrandr-dev \
+        libxshmfence-dev \
+        libxxf86vm-dev; \
     \
-    # DRM + misc
+    # DRM + misc (libudev-dev improves DRM device enumeration for radeonsi)
     apt-get install -y --no-install-recommends \
         libdrm-dev \
+        libudev-dev \
         libzstd-dev zlib1g-dev libexpat1-dev \
         ocl-icd-opencl-dev \
         clinfo; \
@@ -290,12 +324,16 @@ RUN set -eux; \
         -Dgallium-drivers=radeonsi,llvmpipe,softpipe \
         -Dvulkan-drivers=amd \
         -Dplatforms=x11,wayland \
-        -Dglx=disabled \
-        -Degl=disabled \
-        -Dgbm=disabled \
-        -Dgles1=disabled \
-        -Dgles2=disabled \
-        -Dopengl=false \
+        -Dopengl=true \
+        -Dgles1=enabled \
+        -Dgles2=enabled \
+        -Degl=enabled \
+        -Dgbm=enabled \
+        -Dglx=dri \
+        -Dshared-glapi=enabled \
+        -Ddri3=enabled \
+        -Dglvnd=true \
+        -Dglvnd-vendor-name=mesa \
         -Dgallium-rusticl=true \
         -Dgallium-rusticl-enable-drivers=radeonsi \
         -Dllvm=enabled \
@@ -342,6 +380,18 @@ RUN set -eux; \
         done; \
     fi; \
     \
+    # glvnd EGL vendor registration.
+    # With -Dglvnd=true Mesa builds libEGL_mesa.so.0 / libGLX_mesa.so.0 rather
+    # than libEGL.so.1 / libGL.so.1 — the loaders come from libglvnd. The EGL
+    # vendor JSON tells libEGL which vendor library to dlopen.
+    mkdir -p /etc/glvnd/egl_vendor.d; \
+    EGL_JSON="${MESA_PREFIX}/share/glvnd/egl_vendor.d/50_mesa.json"; \
+    if [ -f "${EGL_JSON}" ]; then \
+        ln -sf "${EGL_JSON}" /etc/glvnd/egl_vendor.d/40_mesa-custom.json; \
+    else \
+        echo "WARNING: glvnd EGL vendor JSON not found at ${EGL_JSON}"; \
+    fi; \
+    \
     # ldconfig
     echo "${MESA_PREFIX}/lib/${LIB_ARCH}" > /etc/ld.so.conf.d/mesa-rusticl.conf; \
     ldconfig
@@ -369,21 +419,45 @@ RUN set -eux; \
         exit 1; \
     }
 
-# Minimal runtime deps: OpenCL loader, Vulkan loader, DRM, clinfo, vulkaninfo
+# Runtime deps: OpenCL loader, Vulkan loader, glvnd GL loaders, DRM, X/Wayland.
+# The glvnd loaders (libGL/libGLX/libEGL/libGLES) come from the distro; the
+# vendor implementations (libGLX_mesa, libEGL_mesa) come from our build.
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         ocl-icd-libopencl1 \
         libvulkan1 \
         vulkan-tools \
+        libglvnd0 \
+        libgl1 \
+        libglx0 \
+        libegl1 \
+        libgles2 \
+        libopengl0 \
+        mesa-utils \
         libdrm-amdgpu1 \
+        libudev1 \
         libzstd1 \
         libexpat1 \
         libelf1 \
         clinfo \
         libwayland-client0 \
+        libwayland-server0 \
+        libwayland-egl1 \
         libx11-6 \
         libxcb1 \
-        libxshmfence1 && \
+        libxcb-glx0 \
+        libxcb-dri3-0 \
+        libxcb-present0 \
+        libxcb-randr0 \
+        libxcb-shm0 \
+        libxcb-sync1 \
+        libxcb-xfixes0 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxrandr2 \
+        libxshmfence1 \
+        libxxf86vm1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the Mesa install tree from builder
@@ -396,15 +470,25 @@ COPY --from=builder /etc/vulkan/icd.d/mesa-261-radv.json \
                     /etc/vulkan/icd.d/mesa-261-radv.json
 COPY --from=builder /etc/vulkan/explicit_layer.d \
                     /etc/vulkan/explicit_layer.d
+COPY --from=builder /etc/glvnd/egl_vendor.d \
+                    /etc/glvnd/egl_vendor.d
 COPY --from=builder /etc/ld.so.conf.d/mesa-rusticl.conf \
                     /etc/ld.so.conf.d/mesa-rusticl.conf
 
 RUN ldconfig
 
-# Runtime environment
+# Runtime environment.
+# ld.so.conf already puts our lib dir on the global search path, so
+# libGLX_mesa / libEGL_mesa / libgbm from this build take precedence over the
+# base image's distro Mesa. __EGL_VENDOR_LIBRARY_DIRS points glvnd at our EGL
+# vendor JSON; LIBGL_DRIVERS_PATH and GBM_BACKENDS_PATH point at our DRI and
+# GBM modules rather than the distro ones.
 ENV RUSTICL_ENABLE=radeonsi \
     DRI_PRIME=0 \
     LD_LIBRARY_PATH=${MESA_PREFIX}/lib/x86_64-linux-gnu \
+    LIBGL_DRIVERS_PATH=${MESA_PREFIX}/lib/x86_64-linux-gnu/dri \
+    GBM_BACKENDS_PATH=${MESA_PREFIX}/lib/x86_64-linux-gnu/gbm \
+    __EGL_VENDOR_LIBRARY_DIRS=${MESA_PREFIX}/share/glvnd/egl_vendor.d \
     VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.x86_64.json
 
 LABEL org.opencontainers.image.title="Mesa ${MESA_VERSION} rusticl+fp16 + RADV Vulkan" \
