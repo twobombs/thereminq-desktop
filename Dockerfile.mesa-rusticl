@@ -8,6 +8,12 @@
 #
 # Multi-stage: builder produces /usr/local/mesa; runtime copies it in cleanly.
 #
+# Base: ubuntu:26.04 for BOTH stages. This matters — noble (24.04) ships
+# meson 1.3.2 (Mesa needs >= 1.4), libdrm 2.4.120 (amdgpu needs >= 2.4.121),
+# rustc 1.75 and bindgen 0.66 (both too old for rusticl in Mesa 26.x).
+# The runtime base image MUST also be on 26.04 or the copied Mesa libs will
+# fail to load on glibc symbol versions.
+#
 # Build:
 #   docker build -f Dockerfile.mesa-rusticl -t mesa-rusticl:26.1.4 .
 #   docker build --build-arg NATIVE=1 -f Dockerfile.mesa-rusticl -t mesa-rusticl:26.1.4-native .
@@ -29,10 +35,15 @@
 #     mesa-rusticl:26.1.4 vulkaninfo --summary
 # =============================================================================
 
-ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_VERSION=26.04
 ARG MESA_VERSION=26.1.4
 ARG MESA_SHA256=072705caa9adf4740f1489194b13e278ad959166863b5271fe423a86353c9ab6
+# Newer point releases on the 26.1 branch, if you want to bump:
+#   26.1.5  (2026-07-16)
+#   26.1.6  5296b88a0f1e012e2cb9ada150a2bbadf728ca81e5a4fb2ab43c83a4d2158606
 ARG MESA_PREFIX=/usr/local/mesa
+# Runtime base — must be built on the same Ubuntu release as the builder
+ARG RUNTIME_BASE=twobombs/thereminq-desktop
 # Set NATIVE=1 at build time to enable -march=native
 ARG NATIVE=0
 
@@ -57,7 +68,7 @@ RUN set -eux; \
     \
     # Probe for the highest available LLVM version
     LLVM_VER=""; \
-    for v in 22 21 20 19 18 17 16 15; do \
+    for v in 24 23 22 21 20 19 18 17 16 15; do \
         if apt-cache show "llvm-${v}-dev" >/dev/null 2>&1; then \
             LLVM_VER="${v}"; break; \
         fi; \
@@ -139,14 +150,19 @@ RUN set -eux; \
         apt-get install -y --no-install-recommends vulkan-validationlayers-dev; \
     fi; \
     \
-    # Wayland / XCB WSI stubs (RADV links against these even headless)
+    # Wayland / XCB WSI (RADV links against these even headless).
+    # wayland-protocols, xcb-xfixes and xcb-sync are NOT pulled in transitively
+    # by libwayland-dev / libxcb-dri3-dev — meson will fail without them.
     apt-get install -y --no-install-recommends \
         libwayland-dev \
+        wayland-protocols \
         libx11-xcb-dev \
         libxcb-dri3-dev \
         libxcb-present-dev \
         libxcb-randr0-dev \
         libxcb-shm0-dev \
+        libxcb-sync-dev \
+        libxcb-xfixes0-dev \
         libxshmfence-dev; \
     \
     # DRM + misc
@@ -159,7 +175,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     \
     # Verify LLVM / llvm-spirv major version alignment
-    LLVM_MAJOR=$(llvm-config --version 2>/dev/null | grep -oP '^\d+' || echo "?"); \
+    LLVM_MAJOR=$("/usr/bin/llvm-config-${LLVM_VER}" --version 2>/dev/null | grep -oP '^\d+' || echo "?"); \
     SPIRV_MAJOR=$(llvm-spirv --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1 | cut -d. -f1 || echo "?"); \
     if [ "${LLVM_MAJOR}" != "?" ] && [ "${SPIRV_MAJOR}" != "?" ] && [ "${LLVM_MAJOR}" != "${SPIRV_MAJOR}" ]; then \
         echo "ERROR: LLVM major (${LLVM_MAJOR}) != llvm-spirv major (${SPIRV_MAJOR})"; exit 1; \
@@ -167,8 +183,38 @@ RUN set -eux; \
     echo "LLVM_VER=${LLVM_VER}" > /tmp/llvm_ver.env
 
 # ---------------------------------------------------------------------------
+# Phase 1.1: Toolchain floor checks
+# Fail loudly here rather than 200 lines into an opaque meson error.
+#   meson   >= 1.4.0   (Mesa top-level meson.build)
+#   libdrm  >= 2.4.121 (amdgpu: radeonsi + RADV)
+#   rustc   >= 1.85    (rusticl MSRV tracks Debian stable)
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    echo "--- toolchain versions ---"; \
+    meson --version; \
+    ninja --version; \
+    rustc --version; \
+    (bindgen --version || echo "bindgen: MISSING"); \
+    pkg-config --modversion libdrm; \
+    pkg-config --modversion libdrm_amdgpu; \
+    echo "--------------------------"; \
+    \
+    ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }; \
+    \
+    MESON_V=$(meson --version); \
+    ver_ge "${MESON_V}" "1.4.0" || { echo "ERROR: meson ${MESON_V} < 1.4.0"; exit 1; }; \
+    \
+    DRM_V=$(pkg-config --modversion libdrm_amdgpu); \
+    ver_ge "${DRM_V}" "2.4.121" || { echo "ERROR: libdrm_amdgpu ${DRM_V} < 2.4.121"; exit 1; }; \
+    \
+    RUST_V=$(rustc --version | awk '{print $2}'); \
+    ver_ge "${RUST_V}" "1.85.0" || { echo "ERROR: rustc ${RUST_V} < 1.85.0 (rusticl MSRV)"; exit 1; }; \
+    \
+    command -v bindgen >/dev/null || { echo "ERROR: bindgen not on PATH"; exit 1; }
+
+# ---------------------------------------------------------------------------
 # Phase 1.5: Build custom libclc from source
-# (Fixes Ubuntu's missing FP16 builtins; targets spirv-mesa3d / spirv64-mesa3d)
+# (Fixes distro libclc's missing FP16 builtins; targets spirv-mesa3d / spirv64-mesa3d)
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     LLVM_VER=$(cat /tmp/llvm_ver.env | cut -d= -f2); \
@@ -189,6 +235,7 @@ RUN set -eux; \
     git config core.sparseCheckout true; \
     echo "libclc/" >> .git/info/sparse-checkout; \
     if ! git pull -q --depth=1 origin "release/${LLVM_VER}.x" 2>/dev/null; then \
+        echo "WARNING: no release/${LLVM_VER}.x branch, falling back to main"; \
         git pull -q --depth=1 origin main; \
     fi; \
     \
@@ -210,6 +257,9 @@ RUN set -eux; \
 
 # ---------------------------------------------------------------------------
 # Phase 2-4: Fetch, configure, build, and install Mesa
+#
+# NOTE: meson setup pulls Rust crate subprojects (syn, quote, proc-macro2, ...)
+# from wrapdb/crates.io. This step needs outbound network access.
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     MESA_PREFIX="${MESA_PREFIX}"; \
@@ -222,7 +272,6 @@ RUN set -eux; \
     tar -xJ -C /tmp/mesa-build --strip-components=1 -f "${TARBALL}"; \
     rm "${TARBALL}"; \
     \
-    LIB_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH); \
     GCC_DIR=$(dirname "$(gcc -print-libgcc-file-name)"); \
     \
     export PKG_CONFIG_PATH="${MESA_PREFIX}/share/pkgconfig:${MESA_PREFIX}/lib/pkgconfig"; \
@@ -234,7 +283,7 @@ RUN set -eux; \
     fi; \
     \
     cd /tmp/mesa-build; \
-    meson setup builddir \
+    if ! meson setup builddir \
         --prefix="${MESA_PREFIX}" \
         --buildtype=release \
         -Db_ndebug=true \
@@ -248,11 +297,16 @@ RUN set -eux; \
         -Dgles2=disabled \
         -Dopengl=false \
         -Dgallium-rusticl=true \
+        -Dgallium-rusticl-enable-drivers=radeonsi \
         -Dllvm=enabled \
         -Dshared-llvm=enabled \
         -Drust_std=2021 \
         -Dvulkan-layers=device-select,overlay \
-        ${NATIVE_FLAGS}; \
+        ${NATIVE_FLAGS}; then \
+        echo "===== meson-log.txt ====="; \
+        cat builddir/meson-logs/meson-log.txt || true; \
+        exit 1; \
+    fi; \
     \
     ninja -C builddir -j"$(nproc)"; \
     ninja -C builddir install; \
@@ -278,10 +332,10 @@ RUN set -eux; \
         ln -sf "${RADV_ICD}" /etc/vulkan/icd.d/mesa-261-radv.json || \
         echo "WARNING: RADV ICD JSON not found at ${RADV_ICD}"; \
     \
-    # Vulkan explicit layers
+    # Vulkan explicit layers (dir is always created so the COPY below can't fail)
+    mkdir -p /etc/vulkan/explicit_layer.d; \
     LAYER_SRC="${MESA_PREFIX}/share/vulkan/explicit_layer.d"; \
     if [ -d "${LAYER_SRC}" ]; then \
-        mkdir -p /etc/vulkan/explicit_layer.d; \
         for f in "${LAYER_SRC}"/*.json; do \
             [ -f "$f" ] || continue; \
             ln -sf "$f" "/etc/vulkan/explicit_layer.d/$(basename "$f")"; \
@@ -295,14 +349,25 @@ RUN set -eux; \
 # =============================================================================
 # Stage 2: runtime
 # Lean image: only the Mesa install + runtime libs, no build tools.
+# The base MUST be built on ubuntu:26.04 to match the builder's glibc.
 # =============================================================================
-FROM twobombs/thereminq-desktop AS runtime
+FROM ${RUNTIME_BASE} AS runtime
 
 ARG MESA_PREFIX
 ARG MESA_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC
+
+# Fail fast if the runtime base is not on the same Ubuntu release as the builder
+RUN set -eux; \
+    . /etc/os-release; \
+    echo "runtime base: ${PRETTY_NAME}"; \
+    [ "${VERSION_ID}" = "26.04" ] || { \
+        echo "ERROR: runtime base is Ubuntu ${VERSION_ID}, expected 26.04."; \
+        echo "Mesa libs built on 26.04 will not load against an older glibc."; \
+        exit 1; \
+    }
 
 # Minimal runtime deps: OpenCL loader, Vulkan loader, DRM, clinfo, vulkaninfo
 RUN apt-get update -qq && \
@@ -344,4 +409,3 @@ ENV RUSTICL_ENABLE=radeonsi \
 
 LABEL org.opencontainers.image.title="Mesa ${MESA_VERSION} rusticl+fp16 + RADV Vulkan" \
       org.opencontainers.image.description="Mesa rusticl OpenCL (cl_khr_fp16) and RADV Vulkan for vega20 / Radeon Pro V340"
-
