@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # -- Configuration -------------------------------------------------------------
-MESA_VERSION="26.1.4"
+MESA_VERSION="26.2.1"
 MESA_SHA256="072705caa9adf4740f1489194b13e278ad959166863b5271fe423a86353c9ab6"
 MESA_URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
 MESA_PREFIX="/usr/local/mesa"
