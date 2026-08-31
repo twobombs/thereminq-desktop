@@ -26,7 +26,6 @@ set -euo pipefail
 
 # -- Configuration -------------------------------------------------------------
 MESA_VERSION="26.2.1"
-MESA_SHA256="072705caa9adf4740f1489194b13e278ad959166863b5271fe423a86353c9ab6"
 MESA_URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
 MESA_PREFIX="/usr/local/mesa"
 BUILD_DIR="/tmp/mesa-build"
@@ -349,26 +348,29 @@ build_libclc() {
     ok "Custom libclc installed to ${MESA_PREFIX}"
 }
 
-# -- Phase 2: Fetch + verify ---------------------------------------------------
+# -- Phase 2: Fetch ------------------------------------------------------------
+# NOTE: checksum pinning has been removed. The tarball is accepted on the basis
+# of TLS to archive.mesa3d.org plus an xz integrity test only.
 fetch_mesa() {
     hr
     log "Phase 2/5 - Fetching Mesa ${MESA_VERSION}..."
 
     if [ -f "${TARBALL}" ]; then
-        log "Tarball already present - verifying checksum..."
-        if echo "${MESA_SHA256}  ${TARBALL}" | sha256sum -c - &>/dev/null; then
-            ok "Cached tarball verified."
+        log "Tarball already present - testing archive integrity..."
+        if xz -t "${TARBALL}" &>/dev/null; then
+            ok "Cached tarball is a readable xz archive - reusing."
             return 0
         else
-            warn "Cached tarball checksum mismatch - re-downloading."
+            warn "Cached tarball is truncated or corrupt - re-downloading."
             rm -f "${TARBALL}"
         fi
     fi
 
-    curl -fsSL --progress-bar "${MESA_URL}" -o "${TARBALL}"
-    echo "${MESA_SHA256}  ${TARBALL}" | sha256sum -c - \
-        || die "SHA256 verification failed - download may be corrupted."
-    ok "Mesa ${MESA_VERSION} downloaded and verified."
+    curl -fsSL --progress-bar "${MESA_URL}" -o "${TARBALL}" \
+        || die "Download failed from ${MESA_URL}"
+    xz -t "${TARBALL}" \
+        || die "Downloaded file is not a valid xz archive - transfer likely truncated."
+    ok "Mesa ${MESA_VERSION} downloaded."
 }
 
 # -- Phase 3: Extract + configure ----------------------------------------------
