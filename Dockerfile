@@ -51,8 +51,9 @@ RUN adduser --disabled-password --gecos "" thereminq && \
 # Copy desktop background
 COPY thereminq-wide.png /usr/share/backgrounds/xfce/xfce-verticals.png
 
-# copy mesa fp16 
+# copy mesa fp16 scripts
 COPY build_mesa_rusticl_fp16.sh /root/build_mesa_rusticl_fp16.sh
+COPY build_mesa_rusticl_fp16-all.sh /root/build_mesa_rusticl_fp16-all.sh
 
 # backwards compatibility until NVK driver matures
 # RUN echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
