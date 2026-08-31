@@ -8,8 +8,8 @@
 #   * rusticl OpenCL ICD with cl_khr_fp16 for vega20 (Radeon Pro VII)
 #   * Vulkan: RADV (amd) + lavapipe + anv/hasvk/nvk/virtio where available
 #   * OpenGL / GLES1 / GLES2 / GLX(dri) / EGL / GBM
-#   * All buildable Gallium drivers for the host arch (radeonsi, r300, r600,
-#     nouveau, iris, crocus, i915, svga, virgl, zink, d3d12, llvmpipe, softpipe)
+#   * All x86_64 Gallium drivers (radeonsi, r300, r600, nouveau, iris, crocus,
+#     i915, svga, virgl, zink, d3d12, llvmpipe, softpipe) - no ARM/SoC targets
 #   * Video + state trackers: VA-API, VDPAU, XA, gallium-nine, all video codecs
 #   * Vulkan layers (device-select, overlay, screenshot, vram-report-limit, ...)
 #
@@ -59,13 +59,17 @@ else
 fi
 ARCH="$(uname -m)"
 
-# Driver wish-lists. Anything meson does not offer is dropped automatically.
-GALLIUM_WANT_X86="radeonsi,r300,r600,nouveau,iris,crocus,i915,svga,virgl,zink,d3d12,llvmpipe,softpipe"
-GALLIUM_WANT_ARM="radeonsi,nouveau,panfrost,lima,v3d,vc4,freedreno,etnaviv,tegra,asahi,virgl,zink,llvmpipe,softpipe"
-VULKAN_WANT_X86="amd,intel,intel_hasvk,nouveau,swrast,virtio,gfxstream"
-VULKAN_WANT_ARM="amd,broadcom,freedreno,panfrost,asahi,imagination,nouveau,swrast,virtio"
+# Driver wish-lists (x86_64 desktop/workstation only - no ARM/SoC targets).
+# Anything meson does not offer is dropped automatically.
+GALLIUM_WANT="radeonsi,r300,r600,nouveau,iris,crocus,i915,svga,virgl,zink,d3d12,llvmpipe,softpipe"
+VULKAN_WANT="amd,intel,intel_hasvk,nouveau,swrast,virtio,gfxstream"
 VK_LAYERS_WANT="device-select,overlay,screenshot,vram-report-limit,anti-lag,intel-nullhw"
 PLATFORMS_WANT="x11,wayland"
+
+# ARM / embedded-SoC drivers. Never built, including under --all-drivers.
+ARM_DRIVERS="panfrost panthor lima v3d vc4 freedreno etnaviv tegra asahi kmsro \
+broadcom imagination powervr rogue vivante mali midgard bifrost valhall \
+nouveau-tegra swr arm"
 
 # Colour helpers - fall back gracefully if not a terminal
 if [ -t 1 ]; then
@@ -114,6 +118,13 @@ check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         die "This script must be run as root (use sudo)."
     fi
+}
+
+check_arch() {
+    case "$ARCH" in
+        x86_64) ok "Host architecture: ${ARCH}" ;;
+        *) die "This script targets x86_64 only (host is ${ARCH}). ARM/SoC drivers are deliberately not supported." ;;
+    esac
 }
 
 mesa_env_exports() {
@@ -600,20 +611,19 @@ configure_mesa() {
         -Db_ndebug=true
     )
 
-    # ---- driver selection ----------------------------------------------------
+    # ---- driver selection (x86_64 only; ARM/SoC drivers never built) ---------
     local gallium vulkan platforms layers codecs
-    case "$ARCH" in
-        x86_64|i?86) gallium="$GALLIUM_WANT_X86"; vulkan="$VULKAN_WANT_X86" ;;
-        *)           gallium="$GALLIUM_WANT_ARM"; vulkan="$VULKAN_WANT_ARM" ;;
-    esac
+    gallium="$GALLIUM_WANT"
+    vulkan="$VULKAN_WANT"
 
     if [ "$FEATURES" = "minimal" ]; then
         gallium="radeonsi,llvmpipe,softpipe"
         vulkan="amd"
     elif [ "$ALL_DRIVERS" = "true" ]; then
-        gallium=$(all_values gallium-drivers auto || echo "$gallium")
-        vulkan=$(all_values vulkan-drivers auto || echo "$vulkan")
-        log "--all-drivers: building every driver this Mesa offers."
+        # "all" still means "all x86 drivers" - ARM/SoC targets stay excluded.
+        gallium=$(all_values gallium-drivers auto ${ARM_DRIVERS} || echo "$gallium")
+        vulkan=$(all_values vulkan-drivers auto ${ARM_DRIVERS} || echo "$vulkan")
+        log "--all-drivers: every x86_64 driver this Mesa offers (ARM/SoC excluded)."
     fi
 
     gallium=$(filter_values gallium-drivers "$gallium")
@@ -881,6 +891,7 @@ main() {
     hr
 
     check_root
+    check_arch
 
     case "$MODE" in
         verify)
