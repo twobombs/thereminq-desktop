@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # -- Configuration -------------------------------------------------------------
-MESA_VERSION="26.2.1"
+MESA_VERSION="26.1.4"
 MESA_URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
 MESA_PREFIX="/usr/local/mesa"
 BUILD_DIR="/tmp/mesa-build"
