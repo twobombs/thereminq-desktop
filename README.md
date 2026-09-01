@@ -45,8 +45,7 @@ docker run -d \
   -p 5900:5900 \
   -p 3389:3389 \
   --privileged \
-  --name thereminq-desktop \
-  thereminq-desktop
+  twobombs/thereminq-desktop
 ```
 
 ### Accessing the Desktop
