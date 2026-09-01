@@ -6,7 +6,8 @@
 # feature set rather than a compute-only slice:
 #
 #   * rusticl OpenCL ICD with cl_khr_fp16 for vega20 (Radeon Pro VII)
-#   * Vulkan: RADV (amd) + lavapipe + anv/hasvk/nvk/virtio where available
+#   * Vulkan: RADV (amd) + NVK (nouveau) + lavapipe + anv/hasvk/virtio
+#   * NVIDIA OSS compute path: nouveau gallium + NVK + rusticl-on-nouveau
 #   * OpenGL / GLES1 / GLES2 / GLX(dri) / EGL / GBM
 #   * All x86_64 Gallium drivers (radeonsi, r300, r600, nouveau, iris, crocus,
 #     i915, svga, virgl, zink, d3d12, llvmpipe, softpipe) - no ARM/SoC targets
@@ -26,6 +27,8 @@
 #   sudo ./build_mesa_rusticl_fp16.sh --all-drivers  # every driver meson offers
 #   sudo ./build_mesa_rusticl_fp16.sh --minimal      # old compute-only config
 #   sudo ./build_mesa_rusticl_fp16.sh --glvnd        # build as a glvnd vendor
+#   sudo ./build_mesa_rusticl_fp16.sh --skip-nouveau # drop nouveau/NVK entirely
+#   sudo ./build_mesa_rusticl_fp16.sh --no-rustup    # never bootstrap a Rust toolchain
 #   sudo ./build_mesa_rusticl_fp16.sh --system-libs  # register libs w/ ldconfig
 #   sudo ./build_mesa_rusticl_fp16.sh --verify       # verify only (no build)
 #   sudo ./build_mesa_rusticl_fp16.sh --icd-only     # re-register ICDs only
@@ -92,6 +95,8 @@ FEATURES="all"        # all | minimal
 ALL_DRIVERS="false"
 USE_GLVND="false"
 SYSTEM_LIBS="false"
+SKIP_NOUVEAU="false"
+NO_RUSTUP="false"
 JOBS="$(nproc)"
 
 while [ $# -gt 0 ]; do
@@ -102,6 +107,8 @@ while [ $# -gt 0 ]; do
         --minimal)     FEATURES="minimal" ;;
         --all-drivers) ALL_DRIVERS="true" ;;
         --glvnd)       USE_GLVND="true" ;;
+        --skip-nouveau) SKIP_NOUVEAU="true" ;;
+        --no-rustup)   NO_RUSTUP="true" ;;
         --system-libs) SYSTEM_LIBS="true" ;;
         --jobs)        shift; JOBS="${1:?--jobs needs a number}" ;;
         --jobs=*)      JOBS="${1#*=}" ;;
@@ -129,7 +136,7 @@ check_arch() {
 
 mesa_env_exports() {
     cat <<ENVBLOCK
-export RUSTICL_ENABLE=\${RUSTICL_ENABLE:-radeonsi}
+export RUSTICL_ENABLE=\${RUSTICL_ENABLE:-radeonsi,nouveau}
 export DRI_PRIME=\${DRI_PRIME:-0}
 export LD_LIBRARY_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}:\${LD_LIBRARY_PATH:-}
 export LIBGL_DRIVERS_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}/dri
@@ -195,6 +202,87 @@ verify_vulkan() {
     return 0
 }
 
+verify_nouveau() {
+    hr
+    log "Verifying nouveau / NVK (NVIDIA OSS compute) readiness..."
+
+    # ---- built artefacts -----------------------------------------------------
+    local libdir="${MESA_PREFIX}/lib/${LIB_ARCH}"
+    local nvk_icd="${MESA_PREFIX}/share/vulkan/icd.d/nouveau_icd.${ARCH}.json"
+    if [ -f "${nvk_icd}" ]; then
+        ok "NVK ICD built: ${nvk_icd}"
+    else
+        warn "No NVK ICD at ${nvk_icd} - nouveau was not in vulkan-drivers."
+    fi
+    if ls "${libdir}"/dri/nouveau_dri.so "${libdir}"/dri/libgallium*.so &>/dev/null; then
+        ok "Gallium DRI modules present in ${libdir}/dri"
+    fi
+
+    # ---- kernel side ---------------------------------------------------------
+    if grep -qw nouveau /proc/modules 2>/dev/null; then
+        ok "nouveau kernel module is loaded on the host."
+    elif [ -d /sys/module/nouveau ]; then
+        ok "nouveau is built into the running kernel."
+    else
+        warn "nouveau kernel module NOT loaded."
+        warn "NVK and rusticl-on-nouveau need the OSS kernel driver; the proprietary"
+        warn "nvidia module claims the device exclusively. On the host:"
+        warn "  modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia; modprobe nouveau"
+    fi
+
+    if grep -qw "nvidia" /proc/modules 2>/dev/null; then
+        warn "Proprietary 'nvidia' module is loaded - it will block nouveau from binding."
+    fi
+
+    # ---- GSP firmware (Turing and newer require it) --------------------------
+    if compgen -G "/lib/firmware/nvidia/*/gsp/*" >/dev/null 2>&1; then
+        ok "GSP firmware present under /lib/firmware/nvidia."
+    else
+        warn "No GSP firmware found under /lib/firmware/nvidia."
+        warn "Turing (TU1xx) and newer need it for nouveau to bring the GPU up:"
+        warn "  apt install linux-firmware   (host side, not just the container)"
+    fi
+
+    # ---- device nodes --------------------------------------------------------
+    local nodes
+    nodes=$(ls /dev/dri/renderD* 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "$nodes" ]; then
+        ok "Render nodes visible in container: ${nodes}"
+    else
+        warn "No /dev/dri/renderD* in this container - nothing can be probed."
+        warn "Run with:  --device /dev/dri  (or --privileged) and the video/render groups."
+    fi
+
+    if command -v lspci &>/dev/null; then
+        lspci -nnk 2>/dev/null | grep -A3 -i "VGA\|3D controller" | grep -i "nvidia\|nouveau" || true
+    fi
+
+    # ---- live probes ---------------------------------------------------------
+    if command -v vulkaninfo &>/dev/null && [ -f "${nvk_icd}" ]; then
+        local nvk_out
+        nvk_out=$( eval "$(mesa_env_exports)"; VK_ICD_FILENAMES="${nvk_icd}" vulkaninfo --summary 2>/dev/null || true )
+        if echo "$nvk_out" | grep -qi "NVK\|nouveau"; then
+            ok "NVK reports a device:"
+            echo "$nvk_out" | grep -E "deviceName|driverName|driverInfo|apiVersion" || true
+        else
+            warn "NVK built but no device enumerated (expected if no NVIDIA GPU is passed through)."
+        fi
+    fi
+
+    if command -v clinfo &>/dev/null; then
+        local nv_cl
+        nv_cl=$( eval "$(mesa_env_exports)"; RUSTICL_ENABLE=nouveau clinfo 2>/dev/null || true )
+        if echo "$nv_cl" | grep -qi "NV\|nouveau"; then
+            ok "rusticl exposes an OpenCL device on nouveau:"
+            echo "$nv_cl" | grep -E "Device Name|Device Version|Max compute units|cl_khr_fp16|cl_khr_fp64" || true
+        else
+            warn "rusticl found no nouveau OpenCL device (RUSTICL_ENABLE=nouveau)."
+            warn "Check the kernel module, GSP firmware and /dev/dri passthrough above."
+        fi
+    fi
+    return 0
+}
+
 verify_gl() {
     hr
     log "Verifying OpenGL / EGL / GBM / video stack..."
@@ -250,6 +338,158 @@ detect_llvm_version() {
 
     [ -n "$ver" ] || die "Could not detect an LLVM version. Install llvm-XX-dev manually."
     echo "$ver"
+}
+
+# -- Rust toolchain + cbindgen (required by src/nouveau/nil => nouveau + NVK) --
+CBINDGEN_MIN="0.25.0"
+CBINDGEN_FALLBACKS="0.29.0 0.28.0 0.27.0 0.26.0"
+RUSTUP_PREFIX="/opt/rust"
+RUSTC_FALLBACK_MIN="1.78.0"
+
+rustc_version() {
+    rustc --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1
+}
+
+version_ge() {  # version_ge HAVE WANT
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
+# Mesa's Rust floor rises fast and NVK's nil crate is usually the first thing to
+# hit it. Read the requirement out of the tree when we can, else assume a floor.
+mesa_rust_requirement() {
+    local want=""
+    if [ -f "${BUILD_DIR}/meson.build" ]; then
+        want=$(grep -hoP "rust[^\n]*version_compare\(\s*'>=\s*\K[0-9]+\.[0-9]+(\.[0-9]+)?" \
+                 "${BUILD_DIR}/meson.build" 2>/dev/null | sort -V | tail -1 || true)
+        [ -n "$want" ] || want=$(grep -hoP "rust_req\w*\s*=\s*'>=?\s*\K[0-9]+\.[0-9]+(\.[0-9]+)?" \
+                 "${BUILD_DIR}/meson.build" 2>/dev/null | sort -V | tail -1 || true)
+    fi
+    echo "${want:-$RUSTC_FALLBACK_MIN}"
+}
+
+bootstrap_rustup() {
+    if [ "$NO_RUSTUP" = "true" ]; then
+        warn "--no-rustup set; not bootstrapping a newer Rust toolchain."
+        return 1
+    fi
+    log "Bootstrapping an up-to-date Rust toolchain into ${RUSTUP_PREFIX}..."
+    export RUSTUP_HOME="${RUSTUP_PREFIX}" CARGO_HOME="${RUSTUP_PREFIX}"
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+         | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path >/dev/null 2>&1; then
+        warn "rustup bootstrap failed (no network to sh.rustup.rs?)."
+        return 1
+    fi
+    export PATH="${RUSTUP_PREFIX}/bin:${PATH}"
+    hash -r
+    # Persist for later phases and for meson's compiler probing.
+    printf 'export RUSTUP_HOME=%s\nexport CARGO_HOME=%s\nexport PATH=%s/bin:$PATH\n' \
+        "${RUSTUP_PREFIX}" "${RUSTUP_PREFIX}" "${RUSTUP_PREFIX}" > /etc/profile.d/rustup-mesa.sh
+    ok "Rust toolchain: $(rustc_version) (rustup, ${RUSTUP_PREFIX})"
+    return 0
+}
+
+ensure_rust_toolchain() {
+    local want have
+    want=$(mesa_rust_requirement)
+    have=$(rustc_version)
+
+    if [ -z "$have" ]; then
+        warn "No rustc on PATH."
+        bootstrap_rustup || die "Rust is required for rusticl and NVK. Install rustc >= ${want}."
+        return 0
+    fi
+
+    if version_ge "$have" "$want"; then
+        ok "rustc ${have} satisfies Mesa's requirement (>= ${want})."
+        return 0
+    fi
+
+    warn "rustc ${have} is older than Mesa's requirement (>= ${want})."
+    if bootstrap_rustup; then
+        have=$(rustc_version)
+        version_ge "$have" "$want" \
+            || die "rustup toolchain ${have} still below ${want}."
+        return 0
+    fi
+    die "rustc ${have} < ${want}. Install a newer toolchain (rustup) and re-run."
+}
+
+cbindgen_ok() {
+    command -v cbindgen &>/dev/null || return 1
+    local v
+    v=$(cbindgen --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -n "$v" ] || return 1
+    version_ge "$v" "$CBINDGEN_MIN"
+}
+
+cargo_install_cbindgen() {  # cargo_install_cbindgen [version]
+    local ver="${1:-}" args=(install --locked cbindgen --root /usr/local)
+    [ -n "$ver" ] && args+=(--version "$ver")
+    CARGO_HOME="${CARGO_HOME:-/tmp/cargo-cbindgen}" cargo "${args[@]}" >/dev/null 2>&1
+}
+
+ensure_cbindgen() {
+    if cbindgen_ok; then
+        ok "cbindgen present: $(cbindgen --version 2>/dev/null | head -1)"
+        return 0
+    fi
+
+    log "cbindgen missing or too old - trying distro packages..."
+    apt_first rust-cbindgen cbindgen
+    hash -r
+    if cbindgen_ok; then
+        ok "cbindgen from apt: $(cbindgen --version 2>/dev/null | head -1)"
+        return 0
+    fi
+
+    command -v cargo &>/dev/null || return 1
+
+    log "Building cbindgen from crates.io (a few minutes)..."
+    if cargo_install_cbindgen; then
+        hash -r
+        cbindgen_ok && { ok "cbindgen: $(cbindgen --version | head -1)"; return 0; }
+    fi
+
+    # Newest cbindgen may need a newer rustc than the host has; walk back.
+    local v
+    for v in $CBINDGEN_FALLBACKS; do
+        log "Retrying with pinned cbindgen ${v}..."
+        if cargo_install_cbindgen "$v"; then
+            hash -r
+            cbindgen_ok && { ok "cbindgen ${v} installed."; return 0; }
+        fi
+    done
+
+    rm -rf /tmp/cargo-cbindgen
+    return 1
+}
+
+# Nouveau/NVK need both a modern rustc and cbindgen. Called when nouveau is in
+# the driver set, and fatal there - silently dropping the driver would defeat
+# the point of the build.
+ensure_nouveau_toolchain() {
+    hr
+    log "Preparing nouveau/NVK build tooling..."
+    ensure_rust_toolchain
+    if ensure_cbindgen; then
+        ok "nouveau/NVK prerequisites satisfied."
+        return 0
+    fi
+    die "cbindgen >= ${CBINDGEN_MIN} could not be installed, and nouveau/NVK need it.
+       Fix the network path to crates.io, install rust-cbindgen manually, or
+       re-run with --skip-nouveau to build without nouveau and NVK."
+}
+
+# drop_value <comma-list> <value>  -> list with that value removed
+drop_value() {
+    local list="$1" drop="$2" out=() v
+    local IFS=','
+    read -ra arr <<<"$list"
+    unset IFS
+    for v in "${arr[@]}"; do
+        [ "$v" = "$drop" ] || out+=("$v")
+    done
+    ( IFS=','; echo "${out[*]}" )
 }
 
 # pkg_exists <name>
@@ -357,6 +597,15 @@ install_deps() {
     # -- Rust ------------------------------------------------------------------
     apt_require rustc cargo rustfmt
     apt_optional bindgen rust-bindgen
+    # Mesa's nouveau NIL layer generates C headers with cbindgen at configure
+    # time; without it `meson setup` aborts outright. Do it early so a missing
+    # toolchain surfaces in ~1 min rather than 9 min into the build.
+    if [ "$SKIP_NOUVEAU" = "true" ]; then
+        log "--skip-nouveau: not installing cbindgen."
+    else
+        ensure_rust_toolchain
+        ensure_cbindgen || warn "cbindgen not yet available; will retry at configure time."
+    fi
 
     # -- SPIR-V tools ----------------------------------------------------------
     apt_require spirv-tools
@@ -389,7 +638,7 @@ install_deps() {
         log "Installing video and state-tracker dependencies..."
         apt_optional libva-dev libvdpau-dev vainfo vdpauinfo \
                      directx-headers-dev libsensors-dev libunwind-dev \
-                     mesa-utils
+                     mesa-utils pciutils
         if [ "$USE_GLVND" = "true" ]; then
             apt_optional libglvnd-dev libglvnd-core-dev
         fi
@@ -665,6 +914,18 @@ configure_mesa() {
 
     gallium=$(filter_values gallium-drivers "$gallium")
     vulkan=$(filter_values vulkan-drivers "$vulkan")
+
+    # nouveau gallium and NVK both build src/nouveau/nil, which needs cbindgen
+    # and a current rustc. This is a wanted target (NVIDIA OSS compute), so a
+    # missing toolchain is a hard error, not a silent driver drop.
+    if [ "$SKIP_NOUVEAU" = "true" ]; then
+        log "--skip-nouveau: excluding nouveau gallium and NVK."
+        gallium=$(drop_value "$gallium" nouveau)
+        vulkan=$(drop_value "$vulkan" nouveau)
+    elif grep -q "nouveau" <<<"${gallium},${vulkan}"; then
+        ensure_nouveau_toolchain
+    fi
+
     platforms=$(filter_values platforms "$PLATFORMS_WANT")
     layers=$(filter_values vulkan-layers "$VK_LAYERS_WANT")
 
@@ -684,6 +945,19 @@ configure_mesa() {
     add_opt "-Dllvm=enabled"
     add_opt "-Dshared-llvm=enabled"
     add_opt "-Drust_std=2021"
+
+    # Newer Mesa gates which gallium drivers rusticl exposes. Enable every
+    # compute-capable one we actually built, so RUSTICL_ENABLE can pick between
+    # radeonsi (Radeon Pro VII) and nouveau (NVIDIA OSS compute) at runtime.
+    if opt_exists "rusticl-enable-drivers"; then
+        local rusticl_want rusticl_drv
+        rusticl_want="$gallium,llvmpipe,swrast"
+        rusticl_drv=$(filter_values rusticl-enable-drivers "$rusticl_want")
+        if [ -n "$rusticl_drv" ]; then
+            add_opt "-Drusticl-enable-drivers=${rusticl_drv}"
+            log "rusticl drivers  : ${rusticl_drv}"
+        fi
+    fi
 
     if [ "$FEATURES" = "minimal" ]; then
         # ---- old compute-only behaviour --------------------------------------
@@ -911,10 +1185,30 @@ ${BOLD}Or export manually (container ENV / ~/.bashrc):${RESET}
 $(mesa_env_exports | sed 's/^/  /')
   export VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${ARCH}.json
 
+${BOLD}NVIDIA OSS compute (nouveau + NVK):${RESET}
+
+  # OpenCL on NVIDIA via rusticl
+  RUSTICL_ENABLE=nouveau mesa-env clinfo
+  # Both GPUs enumerated in one context
+  RUSTICL_ENABLE=radeonsi,nouveau mesa-env clinfo -l
+  # Vulkan compute via NVK
+  VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/nouveau_icd.${ARCH}.json mesa-env vulkaninfo --summary
+  # GL on NVK through zink
+  MESA_LOADER_DRIVER_OVERRIDE=zink mesa-env glxinfo -B
+
+  Host/container requirements for this path:
+    * nouveau kernel module loaded, proprietary 'nvidia' module NOT loaded
+    * GSP firmware present (linux-firmware) for Turing and newer
+    * container started with --device /dev/dri (plus video/render group access)
+  Note the Dockerfile's ENV RUSTICL_ENABLE=radeonsi overrides the default here;
+  set it to radeonsi,nouveau to expose both devices to Qrack.
+
 ${BOLD}Rebuild variants:${RESET}
   --minimal      compute-only (rusticl + radeonsi + RADV, no GL)
   --all-drivers  every gallium/vulkan driver this Mesa offers
   --glvnd        build as a libglvnd vendor instead of standalone libGL
+  --skip-nouveau drop nouveau gallium + NVK (avoids the cbindgen dependency)
+  --no-rustup    fail instead of bootstrapping rustup when rustc is too old
   --system-libs  register ${MESA_PREFIX}/lib/${LIB_ARCH} with ldconfig
 
 ENV
@@ -935,12 +1229,14 @@ main() {
             verify_fp16
             verify_vulkan
             [ "$FEATURES" = "all" ] && verify_gl
+            [ "$SKIP_NOUVEAU" = "true" ] || verify_nouveau
             ;;
         icd)
             register_icd
             verify_fp16
             verify_vulkan
             [ "$FEATURES" = "all" ] && verify_gl
+            [ "$SKIP_NOUVEAU" = "true" ] || verify_nouveau
             print_env_hint
             ;;
         full)
@@ -954,6 +1250,7 @@ main() {
             verify_fp16
             verify_vulkan
             [ "$FEATURES" = "all" ] && verify_gl
+            [ "$SKIP_NOUVEAU" = "true" ] || verify_nouveau
             print_env_hint
             ok "All done. Mesa ${MESA_VERSION} installed with the full feature set."
             ;;
