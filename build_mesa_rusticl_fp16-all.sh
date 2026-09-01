@@ -29,6 +29,7 @@
 #   sudo ./build_mesa_rusticl_fp16.sh --glvnd        # build as a glvnd vendor
 #   sudo ./build_mesa_rusticl_fp16.sh --skip-nouveau # drop nouveau/NVK entirely
 #   sudo ./build_mesa_rusticl_fp16.sh --no-rustup    # never bootstrap a Rust toolchain
+#   sudo ./build_mesa_rusticl_fp16.sh --keep-build   # keep /tmp/mesa-build for debugging
 #   sudo ./build_mesa_rusticl_fp16.sh --system-libs  # register libs w/ ldconfig
 #   sudo ./build_mesa_rusticl_fp16.sh --verify       # verify only (no build)
 #   sudo ./build_mesa_rusticl_fp16.sh --icd-only     # re-register ICDs only
@@ -97,6 +98,8 @@ USE_GLVND="false"
 SYSTEM_LIBS="false"
 SKIP_NOUVEAU="false"
 NO_RUSTUP="false"
+KEEP_BUILD="false"
+RUSTICL_LIBDIR=""
 JOBS="$(nproc)"
 
 while [ $# -gt 0 ]; do
@@ -109,6 +112,7 @@ while [ $# -gt 0 ]; do
         --glvnd)       USE_GLVND="true" ;;
         --skip-nouveau) SKIP_NOUVEAU="true" ;;
         --no-rustup)   NO_RUSTUP="true" ;;
+        --keep-build)  KEEP_BUILD="true" ;;
         --system-libs) SYSTEM_LIBS="true" ;;
         --jobs)        shift; JOBS="${1:?--jobs needs a number}" ;;
         --jobs=*)      JOBS="${1#*=}" ;;
@@ -138,7 +142,7 @@ mesa_env_exports() {
     cat <<ENVBLOCK
 export RUSTICL_ENABLE=\${RUSTICL_ENABLE:-radeonsi,nouveau}
 export DRI_PRIME=\${DRI_PRIME:-0}
-export LD_LIBRARY_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=${RUSTICL_LIBDIR:+${RUSTICL_LIBDIR}:}${MESA_PREFIX}/lib/${LIB_ARCH}:\${LD_LIBRARY_PATH:-}
 export LIBGL_DRIVERS_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}/dri
 export LIBVA_DRIVERS_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}/dri
 export VDPAU_DRIVER_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}/vdpau
@@ -845,6 +849,59 @@ add_opt() {
     fi
 }
 
+# add_opt_required <value> <name> [alt-names...]
+# Tries each option name in turn; dies if none exist. Use for anything whose
+# silent absence would produce a build that looks fine but is missing the
+# feature we came for (rusticl, LLVM, drivers).
+add_opt_required() {
+    local value="$1"; shift
+    local name
+    for name in "$@"; do
+        if opt_exists "$name"; then
+            meson_opts+=("-D${name}=${value}")
+            [ "$name" = "$1" ] || log "using alternate option name: ${name}"
+            return 0
+        fi
+    done
+    die "Mesa ${MESA_VERSION} offers none of these required options: $*
+       The build would silently omit the feature. Check ${MESA_OPT_FILE}."
+}
+
+# Read an option's value back out of the configured build directory.
+build_opt_value() {
+    meson introspect --buildoptions "${BUILD_DIR}/builddir" 2>/dev/null \
+      | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for o in d:
+    if o.get('name') == sys.argv[1]:
+        print(o.get('value'))
+        break
+" "$1"
+}
+
+# Confirm after configure that the features we asked for are really on, before
+# spending 30 minutes compiling something unusable.
+assert_configured() {
+    local rusticl
+    rusticl=$(build_opt_value gallium-rusticl)
+    case "$rusticl" in
+        True|true|1) ok "configure check: gallium-rusticl is enabled." ;;
+        "")          warn "configure check: could not read gallium-rusticl back from meson." ;;
+        *)           die "configure check: gallium-rusticl resolved to '${rusticl}'.
+       rusticl would not be built - aborting before the long compile." ;;
+    esac
+
+    local drivers
+    drivers=$(build_opt_value gallium-drivers)
+    [ -z "$drivers" ] || log "configure check: gallium-drivers = ${drivers}"
+    drivers=$(build_opt_value vulkan-drivers)
+    [ -z "$drivers" ] || log "configure check: vulkan-drivers  = ${drivers}"
+}
+
 # filter_values <option> <comma-list>  -> comma-list intersected with choices
 filter_values() {
     local name="$1" want="$2" avail out=() v dropped=()
@@ -934,15 +991,15 @@ configure_mesa() {
     log "vulkan-drivers  : ${vulkan:-<none>}"
     log "platforms       : ${platforms:-<none>}"
 
-    add_opt "-Dgallium-drivers=${gallium}"
+    add_opt_required "${gallium}" gallium-drivers
     [ -n "$vulkan" ]   && add_opt "-Dvulkan-drivers=${vulkan}"
     [ -n "$platforms" ] && add_opt "-Dplatforms=${platforms}"
     [ -n "$layers" ]   && add_opt "-Dvulkan-layers=${layers}"
 
     # ---- rusticl / OpenCL (the point of the exercise) ------------------------
-    add_opt "-Dgallium-rusticl=true"
+    add_opt_required "true" gallium-rusticl rusticl gallium-opencl-rusticl
     add_opt "-Dopencl-spirv=true"
-    add_opt "-Dllvm=enabled"
+    add_opt_required "enabled" llvm
     add_opt "-Dshared-llvm=enabled"
     add_opt "-Drust_std=2021"
 
@@ -1032,6 +1089,7 @@ configure_mesa() {
     printf '    %s\n' "${meson_opts[@]}"
 
     meson setup builddir "${meson_opts[@]}"
+    assert_configured
     ok "Configuration complete."
 }
 
@@ -1051,19 +1109,78 @@ build_mesa() {
     ninja -C "${BUILD_DIR}/builddir" install
     ok "Install complete."
 
-    log "Cleaning build tree..."
-    rm -rf "${BUILD_DIR}" "${TARBALL}"
-    ok "Build tree removed."
+    # Keep the evidence: once the build tree is gone there is no way to tell
+    # which options meson actually resolved.
+    local info="${MESA_PREFIX}/share/mesa-build-info"
+    mkdir -p "${info}"
+    meson configure "${BUILD_DIR}/builddir" > "${info}/buildoptions.txt" 2>/dev/null || true
+    meson introspect --buildoptions "${BUILD_DIR}/builddir" > "${info}/buildoptions.json" 2>/dev/null || true
+    cp -f "${BUILD_DIR}/builddir/meson-logs/meson-log.txt" "${info}/" 2>/dev/null || true
+    date -u +"built %Y-%m-%dT%H:%M:%SZ mesa ${MESA_VERSION}" > "${info}/stamp.txt"
+    ok "Build metadata saved to ${info}"
+
+    if [ "$KEEP_BUILD" = "true" ]; then
+        log "--keep-build: leaving ${BUILD_DIR} in place."
+    else
+        log "Cleaning build tree..."
+        rm -rf "${BUILD_DIR}" "${TARBALL}"
+        ok "Build tree removed."
+    fi
 }
 
 # -- Phase 5: Register ICDs (OpenCL + Vulkan) ----------------------------------
+find_rusticl_lib() {
+    local f
+    # Preferred location first, then anywhere under the prefix: Mesa has moved
+    # this between ${prefix}/lib and ${prefix}/lib/<triplet> across releases.
+    for f in "${MESA_PREFIX}/lib/${LIB_ARCH}/libRusticlOpenCL.so.1" \
+             "${MESA_PREFIX}/lib/libRusticlOpenCL.so.1"; do
+        [ -e "$f" ] && { echo "$f"; return 0; }
+    done
+    f=$(find "${MESA_PREFIX}" -maxdepth 5 -name 'libRusticlOpenCL.so.1' -print -quit 2>/dev/null)
+    [ -n "$f" ] || f=$(find "${MESA_PREFIX}" -maxdepth 5 -name 'libRusticlOpenCL.so*' -print -quit 2>/dev/null)
+    [ -n "$f" ] || return 1
+    echo "$f"
+}
+
+diagnose_missing_rusticl() {
+    hr
+    warn "libRusticlOpenCL was not installed. What IS in the prefix:"
+    find "${MESA_PREFIX}" -maxdepth 4 -name '*.so*' -printf '  %p\n' 2>/dev/null | head -30
+    echo
+    if [ -f "${MESA_PREFIX}/share/mesa-build-info/buildoptions.txt" ]; then
+        warn "Configured rusticl-related options were:"
+        grep -i "rusticl\|opencl\|llvm" "${MESA_PREFIX}/share/mesa-build-info/buildoptions.txt" \
+            | sed 's/^/  /' | head -20
+    fi
+    echo
+    die "rusticl was configured but produced no library.
+       Most likely causes:
+         * gallium-rusticl was accepted but disabled by a missing dependency
+           (LLVM SPIR-V translator, libclc, or a rust/bindgen version mismatch)
+         * no rusticl-capable driver in gallium-drivers
+       Re-run the build; configure now aborts early if rusticl is off, and
+       ${MESA_PREFIX}/share/mesa-build-info/ holds the meson logs."
+}
+
 register_opencl_icd() {
-    local new_so="${MESA_PREFIX}/lib/${LIB_ARCH}/libRusticlOpenCL.so.1"
+    local new_so
+    if ! new_so=$(find_rusticl_lib); then
+        diagnose_missing_rusticl
+    fi
+    ok "Found rusticl library: ${new_so}"
+
+    local lib_parent
+    lib_parent=$(dirname "${new_so}")
+    if [ "${lib_parent}" != "${MESA_PREFIX}/lib/${LIB_ARCH}" ]; then
+        warn "rusticl installed to ${lib_parent}, not ${MESA_PREFIX}/lib/${LIB_ARCH}."
+        warn "Runtime env below uses the actual path."
+        RUSTICL_LIBDIR="${lib_parent}"
+    fi
+
     local cl_icd="${ICD_VENDORS}/mesa-${MESA_VERSION%%.*}-rusticl.icd"
     local old_icd="${ICD_VENDORS}/rusticl.icd"
     local old_disabled="${ICD_VENDORS}/rusticl.icd.disabled"
-
-    [ -f "${new_so}" ] || die "Expected OpenCL shared lib not found: ${new_so}"
 
     mkdir -p "${ICD_VENDORS}"
     # Absolute path in the ICD means the loader finds it without ldconfig.
@@ -1209,6 +1326,7 @@ ${BOLD}Rebuild variants:${RESET}
   --glvnd        build as a libglvnd vendor instead of standalone libGL
   --skip-nouveau drop nouveau gallium + NVK (avoids the cbindgen dependency)
   --no-rustup    fail instead of bootstrapping rustup when rustc is too old
+  --keep-build   keep the build tree and meson logs after install
   --system-libs  register ${MESA_PREFIX}/lib/${LIB_ARCH} with ldconfig
 
 ENV
