@@ -252,20 +252,63 @@ detect_llvm_version() {
     echo "$ver"
 }
 
+# pkg_exists <name>
+# True only if apt has an *installable candidate*. `apt-cache show` is not
+# enough: obsoleted packages such as vulkan-validationlayers-dev still have a
+# record (referred to by their replacement) but no installation candidate, and
+# apt-get then exits 100 and kills the build under `set -e`.
 pkg_exists() {
-    apt-cache show "$1" &>/dev/null 2>&1
+    local cand
+    cand=$(apt-cache policy "$1" 2>/dev/null | awk -F': ' '/Candidate:/{print $2; exit}')
+    [ -n "$cand" ] && [ "$cand" != "(none)" ]
 }
 
-# install packages that exist, skip the ones that do not
+# apt_require <pkgs...>  - hard failure if any of these cannot be installed
+apt_require() {
+    apt-get install -y --no-install-recommends "$@" \
+        || die "Required packages failed to install: $*"
+}
+
+# apt_optional <pkgs...> - best effort, NEVER fatal.
+# Filters to packages with a real candidate, tries them as one transaction, and
+# falls back to one-by-one so a single bad package cannot take out the rest.
 apt_optional() {
-    local p
+    local p want=()
     for p in "$@"; do
         if pkg_exists "$p"; then
-            apt-get install -y --no-install-recommends "$p"
+            want+=("$p")
         else
-            log "optional package not in archive, skipping: $p"
+            log "optional package has no installation candidate, skipping: $p"
         fi
     done
+    [ ${#want[@]} -gt 0 ] || return 0
+
+    if apt-get install -y --no-install-recommends "${want[@]}" 2>/dev/null; then
+        return 0
+    fi
+
+    warn "Batch install failed; retrying optional packages individually..."
+    for p in "${want[@]}"; do
+        if apt-get install -y --no-install-recommends "$p" 2>/dev/null; then
+            ok "optional: $p"
+        else
+            warn "optional package could not be installed, continuing without it: $p"
+        fi
+    done
+    return 0
+}
+
+# apt_first <pkgs...> - install the first one that has a candidate, else skip
+apt_first() {
+    local p
+    for p in "$@"; do
+        if pkg_exists "$p" && apt-get install -y --no-install-recommends "$p" 2>/dev/null; then
+            ok "selected: $p"
+            return 0
+        fi
+    done
+    log "none of these are available, skipping: $*"
+    return 0
 }
 
 install_deps() {
@@ -279,7 +322,7 @@ install_deps() {
     log "Detected LLVM version: ${VER}"
 
     # -- Core build tools ------------------------------------------------------
-    apt-get install -y --no-install-recommends \
+    apt_require \
         curl ca-certificates xz-utils git cmake \
         meson ninja-build pkg-config \
         python3 python3-mako python3-yaml \
@@ -288,55 +331,49 @@ install_deps() {
     apt_optional python3-ply python3-packaging python3-pycparser
 
     # -- LLVM / Clang ----------------------------------------------------------
-    apt-get install -y --no-install-recommends \
+    apt_require \
         "llvm-${VER}-dev" \
         "libclang-${VER}-dev" \
         "clang-${VER}"
 
-    if pkg_exists "libclang-cpp${VER}-dev"; then
-        apt-get install -y --no-install-recommends "libclang-cpp${VER}-dev"
-    elif pkg_exists "libclang-cpp-${VER}-dev"; then
-        apt-get install -y --no-install-recommends "libclang-cpp-${VER}-dev"
-    fi
+    apt_first "libclang-cpp${VER}-dev" "libclang-cpp-${VER}-dev"
 
     # -- SPIRV-LLVM-Translator -------------------------------------------------
-    if pkg_exists "llvm-spirv-${VER}"; then
-        apt-get install -y --no-install-recommends "llvm-spirv-${VER}"
-        if [ ! -f /usr/bin/llvm-spirv ] && [ -f "/usr/bin/llvm-spirv-${VER}" ]; then
-            ln -sf "/usr/bin/llvm-spirv-${VER}" /usr/bin/llvm-spirv
-        fi
+    apt_optional "llvm-spirv-${VER}"
+    if [ ! -f /usr/bin/llvm-spirv ] && [ -f "/usr/bin/llvm-spirv-${VER}" ]; then
+        ln -sf "/usr/bin/llvm-spirv-${VER}" /usr/bin/llvm-spirv
+        ok "Linked /usr/bin/llvm-spirv -> llvm-spirv-${VER}"
     fi
 
-    if pkg_exists "libllvmspirvlib-${VER}-dev"; then
-        apt-get install -y --no-install-recommends "libllvmspirvlib-${VER}-dev"
-    elif pkg_exists "libllvmspirvlib-dev"; then
-        apt-get install -y --no-install-recommends "libllvmspirvlib-dev"
-    fi
+    apt_first "libllvmspirvlib-${VER}-dev" "libllvmspirvlib-dev"
 
     # -- libclc (kept to satisfy package trees, overridden by build_libclc) ---
     if pkg_exists "libclc-${VER}-dev"; then
-        apt-get install -y --no-install-recommends "libclc-${VER}" "libclc-${VER}-dev"
-    elif pkg_exists "libclc-dev"; then
-        apt-get install -y --no-install-recommends libclc-dev
+        apt_optional "libclc-${VER}" "libclc-${VER}-dev"
+    else
+        apt_optional libclc-dev
     fi
 
     # -- Rust ------------------------------------------------------------------
-    apt-get install -y --no-install-recommends rustc cargo rustfmt
+    apt_require rustc cargo rustfmt
     apt_optional bindgen rust-bindgen
 
     # -- SPIR-V tools ----------------------------------------------------------
-    apt-get install -y --no-install-recommends spirv-tools
+    apt_require spirv-tools
     apt_optional spirv-tools-dev spirv-headers libspirv-cross-c-shared-dev
 
     # -- Vulkan ----------------------------------------------------------------
     log "Installing Vulkan build dependencies..."
-    apt-get install -y --no-install-recommends libvulkan-dev glslang-tools
-    apt_optional glslang-dev libvulkan1 vulkan-utility-libraries-dev \
-                 vulkan-validationlayers-dev vulkan-tools
+    apt_require libvulkan-dev glslang-tools
+    apt_optional glslang-dev libvulkan1 vulkan-tools
+    # vulkan-utility-libraries-dev REPLACES vulkan-validationlayers-dev on
+    # Ubuntu 25.x/26.04 - the old name still has an apt record but no candidate,
+    # so it must be an either/or, never both.
+    apt_first vulkan-utility-libraries-dev vulkan-validationlayers-dev
 
     # -- X11 / XCB / Wayland (needed once GLX+EGL+GBM are enabled) -------------
     log "Installing windowing-system dependencies..."
-    apt-get install -y --no-install-recommends \
+    apt_require \
         libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev \
         libxshmfence-dev libxxf86vm-dev libxrandr-dev libxrender-dev \
         libxcb1-dev libxcb-glx0-dev libxcb-dri2-0-dev libxcb-dri3-dev \
@@ -359,7 +396,7 @@ install_deps() {
     fi
 
     # -- DRM + misc ------------------------------------------------------------
-    apt-get install -y --no-install-recommends \
+    apt_require \
         libdrm-dev libudev-dev \
         libzstd-dev zlib1g-dev libexpat1-dev \
         ocl-icd-opencl-dev \
