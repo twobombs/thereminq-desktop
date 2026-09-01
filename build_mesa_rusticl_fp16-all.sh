@@ -75,10 +75,12 @@ ARM_DRIVERS="panfrost panthor lima v3d vc4 freedreno etnaviv tegra asahi kmsro \
 broadcom imagination powervr rogue vivante mali midgard bifrost valhall \
 nouveau-tegra swr arm"
 
-# Colour helpers - fall back gracefully if not a terminal
+# Colour helpers. Use $'...' so these hold real ESC bytes: `cat <<HEREDOC` does
+# not expand backslash escapes, which is why the hint block printed literal
+# \033[1m sequences.
 if [ -t 1 ]; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+    CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 else
     RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
 fi
@@ -223,6 +225,9 @@ verify_nouveau() {
     fi
 
     # ---- kernel side ---------------------------------------------------------
+    local build_time="false"
+    [ -e /dev/dri ] || build_time="true"
+
     if grep -qw nouveau /proc/modules 2>/dev/null; then
         ok "nouveau kernel module is loaded on the host."
     elif [ -d /sys/module/nouveau ]; then
@@ -251,10 +256,13 @@ verify_nouveau() {
     local nodes
     nodes=$(ls /dev/dri/renderD* 2>/dev/null | tr '\n' ' ' || true)
     if [ -n "$nodes" ]; then
-        ok "Render nodes visible in container: ${nodes}"
+        ok "Render nodes visible: ${nodes}"
     else
-        warn "No /dev/dri/renderD* in this container - nothing can be probed."
-        warn "Run with:  --device /dev/dri  (or --privileged) and the video/render groups."
+        build_time="true"
+        log "No /dev/dri/renderD* here."
+        log "During 'docker build' this is normal - the builder has no GPU access,"
+        log "so nothing can be enumerated yet. The artefact checks above are what"
+        log "matter at this stage."
     fi
 
     if command -v lspci &>/dev/null; then
@@ -268,8 +276,10 @@ verify_nouveau() {
         if echo "$nvk_out" | grep -qi "NVK\|nouveau"; then
             ok "NVK reports a device:"
             echo "$nvk_out" | grep -E "deviceName|driverName|driverInfo|apiVersion" || true
+        elif [ "$build_time" = "true" ]; then
+            log "NVK built; device enumeration deferred to runtime."
         else
-            warn "NVK built but no device enumerated (expected if no NVIDIA GPU is passed through)."
+            warn "NVK built but no device enumerated - check the kernel module and firmware above."
         fi
     fi
 
@@ -279,10 +289,19 @@ verify_nouveau() {
         if echo "$nv_cl" | grep -qi "NV\|nouveau"; then
             ok "rusticl exposes an OpenCL device on nouveau:"
             echo "$nv_cl" | grep -E "Device Name|Device Version|Max compute units|cl_khr_fp16|cl_khr_fp64" || true
+        elif [ "$build_time" = "true" ]; then
+            log "rusticl-on-nouveau built; device enumeration deferred to runtime."
         else
             warn "rusticl found no nouveau OpenCL device (RUSTICL_ENABLE=nouveau)."
             warn "Check the kernel module, GSP firmware and /dev/dri passthrough above."
         fi
+    fi
+
+    if [ "$build_time" = "true" ]; then
+        hr
+        log "To verify the NVIDIA path once the container is actually running:"
+        log "  docker run --rm --device /dev/dri --group-add video --group-add render \\"
+        log "    <image> /root/$(basename "$0") --verify"
     fi
     return 0
 }
@@ -1345,6 +1364,10 @@ register_icd() {
 # -- Runtime environment hint --------------------------------------------------
 print_env_hint() {
     hr
+    local icd_dir="${MESA_PREFIX}/share/vulkan/icd.d" icd_list=""
+    if [ -d "${icd_dir}" ] && compgen -G "${icd_dir}/*.json" >/dev/null; then
+        icd_list=$(printf '%s:' "${icd_dir}"/*.json); icd_list="${icd_list%:}"
+    fi
     cat <<ENV
 ${BOLD}Scoped usage (recommended - no impact on the system GL stack):${RESET}
 
@@ -1357,7 +1380,7 @@ ${BOLD}Scoped usage (recommended - no impact on the system GL stack):${RESET}
 ${BOLD}Or export manually (container ENV / ~/.bashrc):${RESET}
 
 $(mesa_env_exports | sed 's/^/  /')
-  export VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${ARCH}.json
+  export VK_ICD_FILENAMES=${icd_list:-${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${ARCH}.json}
 
 ${BOLD}NVIDIA OSS compute (nouveau + NVK):${RESET}
 
