@@ -619,6 +619,8 @@ install_deps() {
     log "Installing Vulkan build dependencies..."
     apt_require libvulkan-dev glslang-tools
     apt_optional glslang-dev libvulkan1 vulkan-tools
+    # VkLayer_MESA_screenshot links libpng; without it meson aborts.
+    apt_optional libpng-dev libjpeg-dev
     # vulkan-utility-libraries-dev REPLACES vulkan-validationlayers-dev on
     # Ubuntu 25.x/26.04 - the old name still has an apt record but no candidate,
     # so it must be an either/or, never both.
@@ -1031,6 +1033,15 @@ configure_mesa() {
 
     platforms=$(filter_values platforms "$PLATFORMS_WANT")
     layers=$(filter_values vulkan-layers "$VK_LAYERS_WANT")
+
+    # Some layers pull in external libraries that are not needed by any driver.
+    # A missing one aborts configure outright, so drop the layer instead - none
+    # of them matter for compute.
+    if grep -q "screenshot" <<<"${layers}" && ! pkg-config --exists libpng 2>/dev/null; then
+        warn "libpng not found - dropping the Vulkan screenshot layer."
+        warn "Install libpng-dev and re-run if you want it."
+        layers=$(drop_value "$layers" screenshot)
+    fi
 
     [ -n "$gallium" ] || die "No usable gallium drivers left after filtering."
     log "gallium-drivers : ${gallium}"
