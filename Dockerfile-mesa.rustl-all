@@ -1,0 +1,12 @@
+FROM twobombs/thereminq-desktop
+
+# Set noninteractive environment globally
+ENV DEBIAN_FRONTEND=noninteractive
+
+#  Rusticl for AMD
+ENV RUSTICL_ENABLE=radeonsi
+
+RUN cd root && chmod 755 build_mesa_rusticl_fp16-all.sh && ./build_mesa_rusticl_fp16-all.sh && apt clean all
+
+EXPOSE 3389 5900 6080
+ENTRYPOINT ["/root/run"]
