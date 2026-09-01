@@ -664,14 +664,27 @@ check_llvm_spirv_alignment() {
     llvm_ver=$(llvm-config --version 2>/dev/null | grep -oP '^\d+' || echo "?")
     spirv_ver=$(llvm-spirv --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1 | cut -d. -f1 || echo "?")
 
-    if [ "$llvm_ver" = "?" ] || [ "$spirv_ver" = "?" ]; then
-        warn "Could not verify LLVM/spirv-translator version alignment - continuing anyway."
-        return
+    if [ "$llvm_ver" != "?" ] && [ "$spirv_ver" != "?" ]; then
+        if [ "$llvm_ver" != "$spirv_ver" ]; then
+            die "LLVM major (${llvm_ver}) != llvm-spirv major (${spirv_ver}). Install matching llvm-spirv-${llvm_ver} and retry."
+        fi
+        ok "LLVM ${llvm_ver} and llvm-spirv ${spirv_ver} major versions match."
+    else
+        warn "llvm-spirv CLI not found - cannot compare CLI versions."
     fi
-    if [ "$llvm_ver" != "$spirv_ver" ]; then
-        die "LLVM major (${llvm_ver}) != llvm-spirv major (${spirv_ver}). Install matching llvm-spirv-${llvm_ver} and retry."
+
+    # rusticl links LLVMSPIRVLib; the CLI is incidental. Check the library,
+    # because its absence is a common reason for rusticl to be turned off.
+    if pkg-config --exists LLVMSPIRVLib 2>/dev/null; then
+        ok "LLVMSPIRVLib found via pkg-config ($(pkg-config --modversion LLVMSPIRVLib 2>/dev/null))."
+    elif ls /usr/lib/*/libLLVMSPIRVLib.so* &>/dev/null || ls /usr/lib/libLLVMSPIRVLib.so* &>/dev/null; then
+        ok "libLLVMSPIRVLib present on the system."
+    else
+        warn "libLLVMSPIRVLib not found. rusticl needs the SPIRV-LLVM-Translator"
+        warn "library; without it meson may configure rusticl off. Install"
+        warn "libllvmspirvlib-${llvm_ver}-dev (or libllvmspirvlib-dev) if the"
+        warn "configure check below reports gallium-rusticl as disabled."
     fi
-    ok "LLVM ${llvm_ver} and llvm-spirv ${spirv_ver} major versions match."
 }
 
 check_libdrm_version() {
@@ -793,19 +806,52 @@ fetch_mesa() {
 # driver names that this Mesa release does not know about are dropped instead
 # of blowing up `meson setup`.
 MESA_OPT_FILE=""
+MESA_OPT_NAMES=""
+
+# Parse every option name once. This MUST be multiline-aware: Mesa writes
+#   option(
+#     'gallium-drivers',
+# so a line-based grep for "option(\s*'name'" matches nothing and every single
+# option silently looks unsupported.
+load_opt_names() {
+    [ -n "${MESA_OPT_FILE}" ] || return 0
+    MESA_OPT_NAMES=$(python3 - "${MESA_OPT_FILE}" <<'PYEOF'
+import re, sys
+src = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+for m in re.finditer(r"option\(\s*'([^']+)'", src):
+    print(m.group(1))
+PYEOF
+)
+    local n
+    n=$(grep -c . <<<"${MESA_OPT_NAMES}" || echo 0)
+    log "Parsed ${n} meson options from $(basename "${MESA_OPT_FILE}")."
+
+    # Sanity gate: if the parser cannot see options that have existed for a
+    # decade, it is broken - and a broken parser silently drops every -D flag.
+    local probe missing=()
+    for probe in gallium-drivers platforms llvm; do
+        grep -qx -- "$probe" <<<"${MESA_OPT_NAMES}" || missing+=("$probe")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        die "Option parsing failed - core options not found: ${missing[*]}
+       ${MESA_OPT_FILE} may use a format this script cannot read.
+       Refusing to continue: every -D flag would be dropped silently."
+    fi
+    ok "Option parser sanity check passed."
+}
 
 locate_opt_file() {
     local f
     for f in "${BUILD_DIR}/meson.options" "${BUILD_DIR}/meson_options.txt"; do
-        [ -f "$f" ] && { MESA_OPT_FILE="$f"; return 0; }
+        [ -f "$f" ] && { MESA_OPT_FILE="$f"; load_opt_names; return 0; }
     done
-    warn "No meson.options found - option filtering disabled."
-    return 0
+    die "No meson.options / meson_options.txt in ${BUILD_DIR}.
+       Without it every build option would be dropped silently."
 }
 
 opt_exists() {
-    [ -n "${MESA_OPT_FILE}" ] || return 0
-    grep -qE "option\(\s*'$1'" "${MESA_OPT_FILE}"
+    [ -n "${MESA_OPT_NAMES}" ] || return 0
+    grep -qx -- "$1" <<<"${MESA_OPT_NAMES}"
 }
 
 opt_choices() {
