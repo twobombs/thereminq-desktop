@@ -55,6 +55,9 @@ COPY thereminq-wide.png /usr/share/backgrounds/xfce/xfce-verticals.png
 COPY build_mesa_rusticl_fp16.sh /root/build_mesa_rusticl_fp16.sh
 COPY build_mesa_rusticl_fp16-all.sh /root/build_mesa_rusticl_fp16-all.sh
 
+# upgrade mesa stack
+RUN cd root && chmod 755 build_mesa_rusticl_fp16.sh && ./build_mesa_rusticl_fp16.sh && apt clean all
+
 # backwards compatibility until NVK driver matures
 # RUN echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 
