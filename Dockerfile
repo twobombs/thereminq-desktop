@@ -10,8 +10,7 @@ RUN echo "RUSTICL_ENABLE=radeonsi" >> /etc/environment && \
     
 
 # Configure architecture, repositories, and upgrade base system
-RUN dpkg --add-architecture i386 && \
-    apt-get update && \
+RUN apt-get update && \
     apt-get install -y --no-install-recommends apt-utils software-properties-common && \
     add-apt-repository multiverse && \
     apt-get update && \
