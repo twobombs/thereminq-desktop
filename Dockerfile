@@ -19,7 +19,7 @@ RUN apt-get update && \
 # Install consolidated packages logically grouped
 RUN apt-get install -y --no-install-recommends \
     # Base Utilities & Networking
-    adduser btop curl linux-tools-generic locales lynx mc net-tools wget \
+    adduser btop curl linux-tools-generic locales lynx mc net-tools wget fastfetch \
     # X11, Desktop & VNC
     dbus-x11 novnc screen ssh-askpass-gnome tigervnc-scraping-server tightvncserver x11vnc xfce4 xfce4-goodies xrdp arc-theme xterm xvfb gnome-keyring fonts-noto-color-emoji\
     # Virtualization
