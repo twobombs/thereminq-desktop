@@ -35,6 +35,12 @@ To build the Docker image, run:
 docker build -t thereminq-desktop .
 ```
 
+or on ARM mobile in Temux
+
+```bash
+proot-distro build --no-cache -f Dockerfile-arm --install-as thereminq-desktop-arm .
+```
+
 ### Running the Container
 
 To run the container, map the necessary ports. For virtualization support, run in privileged mode:
