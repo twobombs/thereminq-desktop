@@ -65,3 +65,6 @@ docker run -d \
 - **User**: The container runs as the `thereminq` user.
 - **Resolution**: Default screen resolution is set to `2560x1440`.
 - **Password**: The VNC/RDP password `00000000` is pre-configured in the image.
+
+## Deprecation notices
+- NVidia Docker and NVidia drivers: use deploy-nvidia-docker ( also deprecated )
