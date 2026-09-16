@@ -35,6 +35,8 @@ RUN ARCH="$(dpkg --print-architecture)" && \
     wget -qO /tmp/chrome.deb "https://dl.google.com/linux/direct/google-chrome-stable_current_${ARCH}.deb" && \
     apt-get install -y /tmp/chrome.deb && \
     rm /tmp/chrome.deb
+RUN sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-gpu|' \
+    /usr/share/applications/google-chrome.desktop
 
 # Gnome-terminal invocation fix and layer cleanup
 RUN apt-get remove -y gnome-terminal && \
