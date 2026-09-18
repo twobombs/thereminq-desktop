@@ -53,7 +53,7 @@ RUN adduser --disabled-password --gecos "" thereminq && \
     mkdir -p /root/.vnc /root/.config/tigervnc
 
 # Copy desktop background
-COPY thereminq-wide.png /usr/share/backgrounds/xfce/xfce-verticals.png
+COPY thereminq-wide.png /usr/share/xfce4/backdrops/xubuntu-wallpaper.png
 
 # copy mesa fp16 scripts
 COPY build_mesa_rusticl_fp16.sh /root/build_mesa_rusticl_fp16.sh
