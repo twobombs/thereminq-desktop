@@ -142,7 +142,7 @@ check_arch() {
 
 mesa_env_exports() {
     cat <<ENVBLOCK
-export RUSTICL_ENABLE=\${RUSTICL_ENABLE:-radeonsi,nouveau}
+export RUSTICL_ENABLE=\${RUSTICL_ENABLE:-radeonsi,iris,nouveau}
 export DRI_PRIME=\${DRI_PRIME:-0}
 export LD_LIBRARY_PATH=${RUSTICL_LIBDIR:+${RUSTICL_LIBDIR}:}${MESA_PREFIX}/lib/${LIB_ARCH}:\${LD_LIBRARY_PATH:-}
 export LIBGL_DRIVERS_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}/dri
