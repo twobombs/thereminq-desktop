@@ -2,9 +2,13 @@
 # =============================================================================
 # build_mesa_rusticl_fp16.sh
 #
-# Builds Mesa 26.1.4 rusticl OpenCL ICD + Vulkan (radeon/amdvlk via RADV)
-# from source and installs it to /usr/local/mesa, enabling cl_khr_fp16 for
-# vega20 (Radeon Pro VII) under rusticl on Ubuntu 24.04 / 25.x / 26.04.
+# Builds Mesa 26.1.4 rusticl OpenCL ICD + Vulkan from source and installs it
+# to /usr/local/mesa, enabling cl_khr_fp16 under rusticl on
+# Ubuntu 24.04 / 25.x / 26.04.
+#
+#   OpenCL (rusticl): radeonsi (AMD, e.g. vega20 / Radeon Pro VII)
+#                     iris     (Intel Gen8+, e.g. Kaby Lake HD 620)
+#   Vulkan:           RADV (AMD) + ANV (Intel Gen9+)
 #
 # Run as root (or with sudo) inside the container, or directly on the host.
 # Safe to re-run: each phase is idempotent.
@@ -14,12 +18,18 @@
 #   sudo ./build_mesa_rusticl_fp16.sh            # full build
 #   sudo ./build_mesa_rusticl_fp16.sh --native   # full build optimized for host CPU
 #   sudo ./build_mesa_rusticl_fp16.sh --verify   # verify only (no build)
-#   sudo ./build_mesa_rusticl_fp16.sh --icd-only # re-register ICD only
+#   sudo ./build_mesa_rusticl_fp16.sh --icd-only # re-register ICDs only
+#
+# Overridable via environment:
+#   GALLIUM_DRIVERS   (default: radeonsi,iris,llvmpipe,softpipe)
+#   VULKAN_DRIVERS    (default: amd,intel)
+#   RUSTICL_DRIVERS   (default: radeonsi,iris)  - used for verify + env hint
+#   EXTRA_MESON_OPTS  (default: empty)          - e.g. "-Dintel-clc=enabled"
 #
 # After success:
-#   RUSTICL_ENABLE=radeonsi clinfo | grep cl_khr_fp16
-#   RUSTICL_ENABLE=radeonsi DRI_PRIME=0 /usr/local/bin/qrack_cl_precompile
-#   VK_ICD_FILENAMES=/usr/local/mesa/share/vulkan/icd.d/radeon_icd.x86_64.json vulkaninfo
+#   RUSTICL_ENABLE=radeonsi,iris clinfo | grep -E "Device Name|cl_khr_fp16"
+#   RUSTICL_ENABLE=radeonsi,iris /usr/local/bin/qrack_cl_precompile
+#   vulkaninfo --summary
 # =============================================================================
 
 set -euo pipefail
@@ -32,6 +42,16 @@ BUILD_DIR="/tmp/mesa-build"
 TARBALL="/tmp/mesa-${MESA_VERSION}.tar.xz"
 ICD_VENDORS="/etc/OpenCL/vendors"
 VK_ICD_DIR="/etc/vulkan/icd.d"
+
+GALLIUM_DRIVERS="${GALLIUM_DRIVERS:-radeonsi,iris,llvmpipe,softpipe}"
+VULKAN_DRIVERS="${VULKAN_DRIVERS:-amd,intel}"
+RUSTICL_DRIVERS="${RUSTICL_DRIVERS:-radeonsi,iris}"
+EXTRA_MESON_OPTS="${EXTRA_MESON_OPTS:-}"
+
+# Vulkan ICD JSON basenames Mesa installs, mapped to our system link names
+#   radeon_icd.<arch>.json -> mesa-261-radv.json
+#   intel_icd.<arch>.json  -> mesa-261-anv.json
+VK_ICD_MAP=("radeon:radv" "intel:anv")
 
 # Dynamically determine the library architecture string (e.g., x86_64-linux-gnu)
 if command -v dpkg-architecture &>/dev/null; then
@@ -63,7 +83,7 @@ for arg in "$@"; do
         --icd-only) MODE="icd" ;;
         --native)   NATIVE_OPT="true" ;;
         --help|-h)
-            sed -n '2,23p' "$0" | sed 's/^# \?//'
+            sed -n '2,33p' "$0" | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown argument: $arg  (try --help)" ;;
     esac
@@ -78,49 +98,84 @@ check_root() {
 
 verify_fp16() {
     hr
-    log "Verifying cl_khr_fp16 availability..."
+    log "Verifying rusticl devices and cl_khr_fp16 availability..."
     if ! command -v clinfo &>/dev/null; then
         warn "clinfo not found - install ocl-icd-opencl-dev or clinfo package."
         return 0
     fi
 
-    local output
-    output=$(RUSTICL_ENABLE=radeonsi clinfo 2>/dev/null || true)
-    echo "$output" | grep -E "Device Name|Driver Version|cl_khr_fp16|Half-precision" || true
+    local drv output
+    IFS=',' read -ra drvs <<< "${RUSTICL_DRIVERS}"
+    for drv in "${drvs[@]}"; do
+        log "Checking rusticl driver: ${drv}"
+        output=$(RUSTICL_ENABLE="${drv}" clinfo 2>/dev/null || true)
 
-    if echo "$output" | grep -q "cl_khr_fp16"; then
-        ok "cl_khr_fp16 is present - Mesa rusticl fp16 is working!"
-    else
-        warn "cl_khr_fp16 not found in clinfo output."
-        warn "Ensure you have the right driver environment and DRI_PRIME variables set."
-    fi
+        if ! echo "$output" | grep -q "Device Name"; then
+            warn "  ${drv}: no device enumerated (no matching GPU, missing /dev/dri node, or driver not built)."
+            continue
+        fi
+
+        echo "$output" | grep -E "Device Name|Driver Version|cl_khr_fp16|Half-precision" | sed 's/^/  /' || true
+
+        if echo "$output" | grep -q "cl_khr_fp16"; then
+            ok "  ${drv}: cl_khr_fp16 is present."
+        else
+            warn "  ${drv}: device found, but cl_khr_fp16 not exposed by this driver/device."
+        fi
+    done
     return 0
 }
 
 verify_vulkan() {
     hr
-    log "Verifying Vulkan (RADV) availability..."
+    log "Verifying Vulkan (RADV / ANV) availability..."
 
-    local vk_icd="${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.x86_64.json"
-    if [ ! -f "${vk_icd}" ]; then
-        warn "RADV ICD JSON not found at ${vk_icd} - Vulkan may not have been built."
+    local arch entry src_name vk_icd found=0
+    arch=$(uname -m)
+
+    for entry in "${VK_ICD_MAP[@]}"; do
+        src_name="${entry%%:*}"
+        vk_icd="${MESA_PREFIX}/share/vulkan/icd.d/${src_name}_icd.${arch}.json"
+        if [ -f "${vk_icd}" ]; then
+            ok "ICD JSON present: ${vk_icd}"
+            found=1
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        warn "No Mesa Vulkan ICD JSONs found under ${MESA_PREFIX}/share/vulkan/icd.d/ - Vulkan may not have been built."
         return 0
     fi
-    ok "RADV ICD JSON present: ${vk_icd}"
 
     if command -v vulkaninfo &>/dev/null; then
         local vk_out
-        vk_out=$(VK_ICD_FILENAMES="${vk_icd}" vulkaninfo --summary 2>/dev/null || true)
-        echo "$vk_out" | grep -E "GPU|driverName|driverInfo|apiVersion" || true
-        if echo "$vk_out" | grep -qi "radv\|radeon"; then
-            ok "RADV Vulkan device detected - Mesa Vulkan is working!"
-        else
-            warn "RADV device not confirmed in vulkaninfo output. Check DRI_PRIME / render node."
+        vk_out=$(VK_ICD_FILENAMES="$(vk_icd_list)" vulkaninfo --summary 2>/dev/null || true)
+        echo "$vk_out" | grep -E "deviceName|driverName|driverInfo|apiVersion" || true
+        if echo "$vk_out" | grep -qi "radv"; then
+            ok "RADV Vulkan device detected."
+        fi
+        if echo "$vk_out" | grep -qi "intel open-source mesa driver\|anv"; then
+            ok "ANV Vulkan device detected."
+        fi
+        if ! echo "$vk_out" | grep -qi "radv\|intel open-source mesa driver\|anv"; then
+            warn "No Mesa Vulkan device confirmed. Check that /dev/dri render nodes are passed into the container."
         fi
     else
         warn "vulkaninfo not installed (apt install vulkan-tools). Skipping live check."
     fi
     return 0
+}
+
+# Colon-separated list of every Mesa Vulkan ICD JSON that was actually built
+vk_icd_list() {
+    local arch entry src_name f list=""
+    arch=$(uname -m)
+    for entry in "${VK_ICD_MAP[@]}"; do
+        src_name="${entry%%:*}"
+        f="${MESA_PREFIX}/share/vulkan/icd.d/${src_name}_icd.${arch}.json"
+        [ -f "$f" ] && list="${list:+${list}:}${f}"
+    done
+    echo "$list"
 }
 
 # -- Phase 1: Dependencies -----------------------------------------------------
@@ -147,9 +202,20 @@ pkg_exists() {
     apt-cache show "$1" &>/dev/null 2>&1
 }
 
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
 install_deps() {
     hr
     log "Phase 1/5 - Installing build dependencies..."
+
+    # Distro rusticl pins its own libclc version, which conflicts with the
+    # libclc matching our LLVM, and would be shadowed by our build anyway.
+    if pkg_installed mesa-opencl-icd; then
+        warn "Distro mesa-opencl-icd is installed - purging it (conflicts with libclc for our LLVM; our rusticl replaces it)."
+        apt-get purge -y mesa-opencl-icd
+    fi
 
     apt-get update -qq
 
@@ -161,7 +227,7 @@ install_deps() {
     apt-get install -y --no-install-recommends \
         curl ca-certificates xz-utils git cmake \
         meson ninja-build pkg-config \
-        python3 python3-mako python3-yaml \
+        python3 python3-mako python3-yaml python3-ply python3-pycparser \
         gcc g++ bison flex libelf-dev
 
     # -- LLVM / Clang ----------------------------------------------------------
@@ -245,7 +311,7 @@ install_deps() {
         apt-get install -y --no-install-recommends vulkan-tools
     fi
 
-    # wayland/xcb stubs needed even with platforms="" so RADV link does not fail
+    # wayland/xcb stubs needed so the Vulkan WSI link does not fail
     apt-get install -y --no-install-recommends \
         libwayland-dev \
         libx11-xcb-dev \
@@ -376,7 +442,7 @@ fetch_mesa() {
 # -- Phase 3: Extract + configure ----------------------------------------------
 configure_mesa() {
     hr
-    log "Phase 3/5 - Configuring Mesa (rusticl + radeonsi + RADV Vulkan)..."
+    log "Phase 3/5 - Configuring Mesa (rusticl: ${GALLIUM_DRIVERS} | Vulkan: ${VULKAN_DRIVERS})..."
 
     rm -rf "${BUILD_DIR}"
     mkdir -p "${BUILD_DIR}"
@@ -388,11 +454,12 @@ configure_mesa() {
         --prefix="${MESA_PREFIX}"
         --buildtype=release
         -Db_ndebug=true
-        # Gallium: radeonsi for OpenCL/rusticl + software fallbacks
-        -Dgallium-drivers=radeonsi,llvmpipe,softpipe
-        # Vulkan: RADV (AMD open-source Vulkan driver)
-        -Dvulkan-drivers=amd
-        # No display platforms needed for compute-only + headless Vulkan
+        # Gallium: radeonsi (AMD) + iris (Intel Gen8+) for rusticl,
+        # plus software fallbacks
+        -Dgallium-drivers="${GALLIUM_DRIVERS}"
+        # Vulkan: RADV (AMD) + ANV (Intel Gen9+)
+        -Dvulkan-drivers="${VULKAN_DRIVERS}"
+        # WSI platforms for the Vulkan drivers
         -Dplatforms=x11,wayland
         -Dglx=disabled
         -Degl=disabled
@@ -402,7 +469,7 @@ configure_mesa() {
         -Dopengl=false
         # rusticl OpenCL
         -Dgallium-rusticl=true
-        # LLVM (required for both radeonsi and RADV)
+        # LLVM (required for radeonsi, RADV and rusticl)
         -Dllvm=enabled
         -Dshared-llvm=enabled
         -Drust_std=2021
@@ -413,6 +480,14 @@ configure_mesa() {
     if [ "$NATIVE_OPT" = "true" ]; then
         meson_opts+=("-Dc_args=-march=native" "-Dcpp_args=-march=native")
         log "Native CPU optimization enabled (-march=native)"
+    fi
+
+    # e.g. EXTRA_MESON_OPTS="-Dintel-clc=enabled" if meson asks for intel_clc
+    if [ -n "${EXTRA_MESON_OPTS}" ]; then
+        # shellcheck disable=SC2206
+        local extra=( ${EXTRA_MESON_OPTS} )
+        meson_opts+=("${extra[@]}")
+        log "Extra meson options: ${EXTRA_MESON_OPTS}"
     fi
 
     export PKG_CONFIG_PATH="${MESA_PREFIX}/share/pkgconfig:${MESA_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -428,7 +503,7 @@ configure_mesa() {
 # -- Phase 4: Build + install --------------------------------------------------
 build_mesa() {
     hr
-    log "Phase 4/5 - Building Mesa (this takes ~10-20 min on nproc=$(nproc))..."
+    log "Phase 4/5 - Building Mesa (this takes ~15-30 min on nproc=$(nproc))..."
 
     local gcc_dir
     gcc_dir=$(dirname "$(gcc -print-libgcc-file-name)")
@@ -449,7 +524,7 @@ build_mesa() {
 # -- Phase 5: Register ICDs (OpenCL + Vulkan) ----------------------------------
 register_icd() {
     hr
-    log "Phase 5/5 - Registering Mesa 26.1 rusticl OpenCL ICD + RADV Vulkan ICD..."
+    log "Phase 5/5 - Registering Mesa 26.1 rusticl OpenCL ICD + Vulkan ICDs..."
 
     # ---- OpenCL --------------------------------------------------------------
     local new_icd="${MESA_PREFIX}/etc/OpenCL/vendors/rusticl.icd"
@@ -476,21 +551,30 @@ register_icd() {
     fi
 
     # ---- Vulkan --------------------------------------------------------------
-    # RADV installs its ICD JSON under ${MESA_PREFIX}/share/vulkan/icd.d/
-    # We symlink it into the system Vulkan ICD search path.
-    local arch
+    # Mesa installs ICD JSONs under ${MESA_PREFIX}/share/vulkan/icd.d/
+    # We symlink each one that was built into the system Vulkan ICD search path.
+    local arch entry src_name link_name src link
     arch=$(uname -m)
-    local radv_icd_src="${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${arch}.json"
-    local vk_link="${VK_ICD_DIR}/mesa-261-radv.json"
+    mkdir -p "${VK_ICD_DIR}"
 
-    if [ -f "${radv_icd_src}" ]; then
-        mkdir -p "${VK_ICD_DIR}"
-        ln -sf "${radv_icd_src}" "${vk_link}"
-        ok "Linked Vulkan ICD: ${vk_link} -> ${radv_icd_src}"
-    else
-        warn "RADV Vulkan ICD JSON not found at ${radv_icd_src}."
-        warn "Vulkan ICD not registered. Check that -Dvulkan-drivers=amd built correctly."
-    fi
+    for entry in "${VK_ICD_MAP[@]}"; do
+        src_name="${entry%%:*}"
+        link_name="${entry##*:}"
+        src="${MESA_PREFIX}/share/vulkan/icd.d/${src_name}_icd.${arch}.json"
+        link="${VK_ICD_DIR}/mesa-261-${link_name}.json"
+
+        if [ -f "${src}" ]; then
+            ln -sf "${src}" "${link}"
+            ok "Linked Vulkan ICD: ${link} -> ${src}"
+        else
+            # Only complain if that driver was requested
+            case ",${VULKAN_DRIVERS}," in
+                *",${src_name/radeon/amd},"*)
+                    warn "Vulkan ICD JSON not found at ${src} (requested in VULKAN_DRIVERS)." ;;
+            esac
+            [ -L "${link}" ] && rm -f "${link}"
+        fi
+    done
 
     # ---- Vulkan layers -------------------------------------------------------
     local layer_dir="${MESA_PREFIX}/share/vulkan/explicit_layer.d"
@@ -511,38 +595,43 @@ register_icd() {
     ok "ldconfig updated."
 
     log "OpenCL ICD content:"
-    cat "${new_icd}" | sed 's/^/  /'
+    sed 's/^/  /' "${new_icd}"
 
-    if [ -f "${radv_icd_src}" ]; then
-        log "Vulkan ICD content:"
-        cat "${radv_icd_src}" | sed 's/^/  /'
-    fi
+    for entry in "${VK_ICD_MAP[@]}"; do
+        src_name="${entry%%:*}"
+        src="${MESA_PREFIX}/share/vulkan/icd.d/${src_name}_icd.${arch}.json"
+        if [ -f "${src}" ]; then
+            log "Vulkan ICD content (${src_name}):"
+            sed 's/^/  /' "${src}"
+        fi
+    done
 }
 
 # -- Runtime environment hint --------------------------------------------------
 print_env_hint() {
-    local arch
-    arch=$(uname -m)
+    local vk_list
+    vk_list=$(vk_icd_list)
     hr
     cat <<ENV
 ${BOLD}Runtime environment required (add to container ENV or ~/.bashrc):${RESET}
 
-  # OpenCL / rusticl
-  export RUSTICL_ENABLE=radeonsi
-  export DRI_PRIME=0
+  # OpenCL / rusticl - each listed driver exposes its own device
+  export RUSTICL_ENABLE=${RUSTICL_DRIVERS}
   export LD_LIBRARY_PATH=${MESA_PREFIX}/lib/${LIB_ARCH}:\${LD_LIBRARY_PATH}
 
-  # Vulkan (RADV) - use the Mesa-built ICD explicitly
-  export VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${arch}.json
+  # Vulkan - Mesa-built ICDs (RADV and/or ANV)
+  export VK_ICD_FILENAMES=${vk_list:-<none built>}
 
-${BOLD}Verify OpenCL fp16:${RESET}
-  RUSTICL_ENABLE=radeonsi clinfo | grep -E "cl_khr_fp16|Half-precision"
+  # Container: pass all render nodes, e.g.  docker run --device /dev/dri ...
 
-${BOLD}Verify Vulkan (RADV):${RESET}
-  VK_ICD_FILENAMES=${MESA_PREFIX}/share/vulkan/icd.d/radeon_icd.${arch}.json vulkaninfo --summary
+${BOLD}Verify OpenCL devices + fp16:${RESET}
+  RUSTICL_ENABLE=${RUSTICL_DRIVERS} clinfo | grep -E "Device Name|cl_khr_fp16|Half-precision"
+
+${BOLD}Verify Vulkan:${RESET}
+  vulkaninfo --summary
 
 ${BOLD}Precompile Qrack kernels:${RESET}
-  RUSTICL_ENABLE=radeonsi DRI_PRIME=0 /usr/local/bin/qrack_cl_precompile
+  RUSTICL_ENABLE=${RUSTICL_DRIVERS} /usr/local/bin/qrack_cl_precompile
 
 ENV
 }
@@ -550,8 +639,9 @@ ENV
 # -- Main ----------------------------------------------------------------------
 main() {
     hr
-    echo -e "${BOLD}Mesa ${MESA_VERSION} rusticl fp16 + RADV Vulkan builder${RESET}"
+    echo -e "${BOLD}Mesa ${MESA_VERSION} rusticl fp16 + Vulkan builder${RESET}"
     echo -e "Mode: ${YELLOW}${MODE}${RESET}  |  Prefix: ${MESA_PREFIX}  |  $(date)"
+    echo -e "Gallium: ${GALLIUM_DRIVERS}  |  Vulkan: ${VULKAN_DRIVERS}  |  rusticl: ${RUSTICL_DRIVERS}"
     hr
 
     check_root
@@ -578,7 +668,7 @@ main() {
             verify_fp16
             verify_vulkan
             print_env_hint
-            ok "All done. Mesa ${MESA_VERSION} rusticl+fp16 and RADV Vulkan are installed."
+            ok "All done. Mesa ${MESA_VERSION} rusticl+fp16 (${RUSTICL_DRIVERS}) and Vulkan (${VULKAN_DRIVERS}) are installed."
             ;;
     esac
 }
