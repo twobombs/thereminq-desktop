@@ -4,9 +4,9 @@ FROM ubuntu:resolute
 ENV DEBIAN_FRONTEND=noninteractive
 
 #  Rusticl for AMD
-ENV RUSTICL_ENABLE=radeonsi
-RUN echo "RUSTICL_ENABLE=radeonsi" >> /etc/environment && \
-    echo "export RUSTICL_ENABLE=radeonsi" >> /root/.bashrc
+ENV RUSTICL_ENABLE=radeonsi,iris
+RUN echo "RUSTICL_ENABLE=radeonsi,iris" >> /etc/environment && \
+    echo "export RUSTICL_ENABLE=radeonsi,iris" >> /root/.bashrc
     
 
 # Configure architecture, repositories, and upgrade base system
